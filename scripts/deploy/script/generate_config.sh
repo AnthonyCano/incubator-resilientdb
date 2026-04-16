@@ -80,3 +80,6 @@ done
 
 python3 ${CONFIG_TOOLS_BIN} ./server.config ./server.config.json ${TEMPLATE_PATH}
 mv server.config.json server.config
+
+python3 ${CONFIG_TOOLS_BIN} ./client.config ./client.config.json
+mv client.config.json client.config
