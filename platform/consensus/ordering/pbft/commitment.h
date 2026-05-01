@@ -46,6 +46,14 @@ class Commitment {
   virtual int ProcessCommitMsg(std::unique_ptr<Context> context,
                                std::unique_ptr<Request> request);
 
+  // 2PC handlers
+  int Process2PCPrepare(std::unique_ptr<Context> context,
+                        std::unique_ptr<Request> request);
+  int Process2PCVote(std::unique_ptr<Context> context,
+                     std::unique_ptr<Request> request);
+  int Process2PCCommit(std::unique_ptr<Context> context,
+                       std::unique_ptr<Request> request);
+
   void SetPreVerifyFunc(std::function<bool(const Request& request)> func);
   void SetNeedCommitQC(bool need_qc);
 
@@ -77,6 +85,11 @@ class Commitment {
            std::pair<std::unique_ptr<Context>, std::unique_ptr<Request>>>
       pending_recovery_;
   std::unique_ptr<DuplicateManager> duplicate_manager_;
+
+  // 2PC state
+  std::mutex twopc_mutex_;
+  std::map<uint64_t, int> vote_count_;  // seq -> number of votes received
+  std::map<uint64_t, std::unique_ptr<Request>> pending_2pc_requests_;  // seq -> request waiting for votes
 };
 
 }  // namespace resdb

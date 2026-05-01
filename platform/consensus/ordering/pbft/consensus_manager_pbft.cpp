@@ -163,6 +163,9 @@ int ConsensusManagerPBFT::ConsensusCommit(std::unique_ptr<Context> context,
         case Request::TYPE_PRE_PREPARE:
         case Request::TYPE_PREPARE:
         case Request::TYPE_COMMIT:
+        case Request::TYPE_2PC_PREPARE:
+        case Request::TYPE_2PC_VOTE:
+        case Request::TYPE_2PC_COMMIT:
           AddPendingRequest(std::move(context), std::move(request));
           return 0;
       }
@@ -271,6 +274,15 @@ int ConsensusManagerPBFT::InternalConsensusCommit(
     case Request::TYPE_RECOVERY_DATA_RESP:
       return ProcessRecoveryDataResponse(std::move(context),
                                          std::move(request));
+    case Request::TYPE_2PC_PREPARE:
+      return commitment_->Process2PCPrepare(std::move(context),
+                                            std::move(request));
+    case Request::TYPE_2PC_VOTE:
+      return commitment_->Process2PCVote(std::move(context),
+                                         std::move(request));
+    case Request::TYPE_2PC_COMMIT:
+      return commitment_->Process2PCCommit(std::move(context),
+                                           std::move(request));
   }
   return 0;
 }

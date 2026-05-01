@@ -137,13 +137,23 @@ int Commitment::ProcessNewRequest(std::unique_ptr<Context> context,
 
   global_stats_->RecordStateTime("request");
 
-  user_request->set_type(Request::TYPE_PRE_PREPARE);
   user_request->set_current_view(message_manager_->GetCurrentView());
   user_request->set_seq(*seq);
   user_request->set_sender_id(config_.GetSelfInfo().id());
   user_request->set_primary_id(config_.GetSelfInfo().id());
 
+  // === 2PC Phase 1: Send PREPARE to all participants ===
+  LOG(ERROR) << "[2PC] Coordinator starting 2PC for seq: " << *seq;
+  user_request->set_type(Request::TYPE_2PC_PREPARE);
   replica_communicator_->BroadCast(*user_request);
+
+  // Store request while waiting for votes
+  {
+    std::lock_guard<std::mutex> lk(twopc_mutex_);
+    user_request->set_type(Request::TYPE_PRE_PREPARE);  // restore for later PBFT use
+    pending_2pc_requests_[*seq] = std::move(user_request);
+    vote_count_[*seq] = 0;
+  }
 
   return 0;
 }
@@ -347,6 +357,90 @@ int Commitment::PostProcessExecutedMsg() {
 
 DuplicateManager* Commitment::GetDuplicateManager() {
   return duplicate_manager_.get();
+}
+
+// =========== 2PC Handlers ===========================
+
+// Participant: receive PREPARE from coordinator, vote YES
+int Commitment::Process2PCPrepare(std::unique_ptr<Context> context,
+                                  std::unique_ptr<Request> request) {
+  uint64_t seq = request->seq();
+  int coordinator_id = request->sender_id();
+  LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
+             << " received PREPARE for seq: " << seq
+             << " from coordinator: " << coordinator_id;
+
+  // Always vote YES (no aborts per assignment spec)
+  Request vote;
+  vote.set_type(Request::TYPE_2PC_VOTE);
+  vote.set_seq(seq);
+  vote.set_sender_id(config_.GetSelfInfo().id());
+  vote.set_current_view(message_manager_->GetCurrentView());
+  vote.set_hash(request->hash());
+  vote.set_proxy_id(request->proxy_id());
+
+  LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
+             << " voting YES for seq: " << seq;
+  replica_communicator_->SendMessage(vote, coordinator_id);
+  return 0;
+}
+
+// Coordinator: collect votes, when all received send GLOBAL_COMMIT then start PBFT
+int Commitment::Process2PCVote(std::unique_ptr<Context> context,
+                               std::unique_ptr<Request> request) {
+  uint64_t seq = request->seq();
+  int voter_id = request->sender_id();
+  LOG(ERROR) << "[2PC] Coordinator received VOTE from replica " << voter_id
+             << " for seq: " << seq;
+
+  std::unique_ptr<Request> stored_request;
+  bool all_votes_received = false;
+
+  {
+    std::lock_guard<std::mutex> lk(twopc_mutex_);
+    vote_count_[seq]++;
+    int num_participants = config_.GetReplicaNum() - 1;  // exclude coordinator
+    LOG(ERROR) << "[2PC] Vote count for seq " << seq << ": "
+               << vote_count_[seq] << "/" << num_participants;
+
+    if (vote_count_[seq] >= num_participants) {
+      all_votes_received = true;
+      stored_request = std::move(pending_2pc_requests_[seq]);
+      pending_2pc_requests_.erase(seq);
+      vote_count_.erase(seq);
+    }
+  }
+
+  if (all_votes_received && stored_request) {
+    // === 2PC Phase 2: Send GLOBAL COMMIT ===
+    LOG(ERROR) << "[2PC] All votes received for seq: " << seq
+               << ". Broadcasting GLOBAL COMMIT.";
+    Request commit_msg;
+    commit_msg.set_type(Request::TYPE_2PC_COMMIT);
+    commit_msg.set_seq(seq);
+    commit_msg.set_sender_id(config_.GetSelfInfo().id());
+    commit_msg.set_current_view(message_manager_->GetCurrentView());
+    commit_msg.set_hash(stored_request->hash());
+    replica_communicator_->BroadCast(commit_msg);
+
+    // === Now proceed with PBFT: broadcast PrePrepare ===
+    LOG(ERROR) << "[2PC] 2PC complete for seq: " << seq
+               << ". Starting PBFT consensus.";
+    stored_request->set_type(Request::TYPE_PRE_PREPARE);
+    replica_communicator_->BroadCast(*stored_request);
+  }
+
+  return 0;
+}
+
+// Participant: receive GLOBAL COMMIT from coordinator
+int Commitment::Process2PCCommit(std::unique_ptr<Context> context,
+                                 std::unique_ptr<Request> request) {
+  uint64_t seq = request->seq();
+  LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
+             << " received GLOBAL COMMIT for seq: " << seq
+             << ". Awaiting PBFT PrePrepare.";
+  return 0;
 }
 
 }  // namespace resdb
