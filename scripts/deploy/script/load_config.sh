@@ -19,8 +19,11 @@
 KEY_FILE="config/key.conf"
 . $1
 
-if [ ! -f "${KEY_FILE}" ]; then
-"please create \"${KEY_FILE}\" and put your ssh key in it"
-exit -1
+if [ -z "${SKIP_DEPLOY_KEY_CHECK}" ] && [ ! -f "${KEY_FILE}" ]; then
+    echo "please create \"${KEY_FILE}\" and put your ssh key in it (see config/key_example.conf)" >&2
+    exit 1
 fi
-. ${KEY_FILE}
+
+if [ -f "${KEY_FILE}" ]; then
+    . "${KEY_FILE}"
+fi

@@ -41,7 +41,10 @@ def cal_tps(tps):
         tps_sum.append(v) 
 
     print("max throughput:",tps_max)
-    print("average throughput:",sum(tps_sum)/len(tps_sum))
+    if not tps_sum:
+        print("average throughput: 0 (no txn samples in logs)")
+    else:
+        print("average throughput:", sum(tps_sum) / len(tps_sum))
 
 def cal_lat(lat):
     lat_sum = []
@@ -53,7 +56,10 @@ def cal_lat(lat):
         lat_sum.append(v) 
 
     print("max latency:",lat_max)
-    print("average latency:",sum(lat_sum)/len(lat_sum))
+    if not lat_sum:
+        print("average latency: 0 (no client latency lines in logs)")
+    else:
+        print("average latency:", sum(lat_sum) / len(lat_sum))
 
 if __name__ == '__main__':
     files = sys.argv[1:]

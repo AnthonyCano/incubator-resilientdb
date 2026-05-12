@@ -86,7 +86,8 @@ function run_cmd(){
   idx=1
   for ip in ${deploy_iplist[@]};
   do
-    cd ${home_path}/${main_folder}/$idx; 
+    mkdir -p ${home_path}/${main_folder}/$idx
+    cd ${home_path}/${main_folder}/$idx
     `$1`
     ((count++))
     ((idx++))

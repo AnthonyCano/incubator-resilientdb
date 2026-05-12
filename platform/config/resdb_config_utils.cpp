@@ -135,9 +135,30 @@ std::vector<ReplicaInfo> ReadConfig(const std::string& file_name) {
   json_data << infile.rdbuf();
   std::string cleanJson = RemoveJsonComments(json_data.str());
 
-  RegionInfo region_info;
   JsonParseOptions options;
-  auto status = JsonStringToMessage(cleanJson, &region_info, options);
+  // Deploy scripts (generate_region_config) emit full ResConfigData JSON with
+  // a top-level "region" array; legacy configs used a single RegionInfo blob.
+  ResConfigData config_data;
+  auto status = JsonStringToMessage(cleanJson, &config_data, options);
+  if (status.ok()) {
+    for (const auto& region : config_data.region()) {
+      for (const auto& replica_info : region.replica_info()) {
+        LOG(ERROR) << "parse json id:" << replica_info.id()
+                   << " ip:" << replica_info.ip()
+                   << " port:" << replica_info.port();
+        replicas.push_back(GenerateReplicaInfo(replica_info.id(),
+                                               replica_info.ip(),
+                                               replica_info.port()));
+      }
+    }
+  }
+
+  if (!replicas.empty()) {
+    return replicas;
+  }
+
+  RegionInfo region_info;
+  status = JsonStringToMessage(cleanJson, &region_info, options);
   if (!status.ok()) {
     LOG(ERROR) << "parse json :" << file_name << " fail:" << status.message();
   }

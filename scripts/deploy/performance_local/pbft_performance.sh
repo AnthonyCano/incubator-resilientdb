@@ -20,5 +20,7 @@
 export server=//benchmark/protocols/pbft:kv_server_performance
 #export TEMPLATE_PATH=$PWD/config/pbft.config
 export performance=true
+# Local perf does not use SSH; deployment scripts skip key.conf when this is set.
+export SKIP_DEPLOY_KEY_CHECK=1
 
 ./performance_local/run_performance.sh $*
