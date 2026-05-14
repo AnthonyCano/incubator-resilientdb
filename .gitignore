@@ -1,6 +1,7 @@
 deps/*/
 scripts/deploy/config/key.conf
 scripts/deploy/config_out/
+scripts/deploy/config_out_sharded/
 deploy/kv_server/output/
 .idea/
 .vscode/

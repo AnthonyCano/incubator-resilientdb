@@ -142,10 +142,28 @@ int Commitment::ProcessNewRequest(std::unique_ptr<Context> context,
   user_request->set_sender_id(config_.GetSelfInfo().id());
   user_request->set_primary_id(config_.GetSelfInfo().id());
 
-  // === 2PC Phase 1: Send PREPARE to all participants ===
+  // === 2PC Phase 1: PREPARE to participants ===
   LOG(ERROR) << "[2PC] Coordinator starting 2PC for seq: " << *seq;
-  user_request->set_type(Request::TYPE_2PC_PREPARE);
-  replica_communicator_->BroadCast(*user_request);
+  const std::vector<ReplicaInfo> cross_peers = config_.GetCrossShardPeers();
+  ReplicaInfo coord_contact;
+  coord_contact.set_id(config_.GetSelfInfo().id());
+  coord_contact.set_ip(config_.GetSelfInfo().ip());
+  coord_contact.set_port(config_.GetSelfInfo().port());
+
+  if (!cross_peers.empty()) {
+    // Cross-shard: other shard leaders vote; coordinator contact in client_info.
+    for (const auto& peer : cross_peers) {
+      Request prep;
+      prep.CopyFrom(*user_request);
+      prep.set_type(Request::TYPE_2PC_PREPARE);
+      *prep.mutable_client_info() = coord_contact;
+      replica_communicator_->SendMessage(prep, peer);
+    }
+  } else {
+    // Legacy intra-shard 2PC among local replicas.
+    user_request->set_type(Request::TYPE_2PC_PREPARE);
+    replica_communicator_->BroadCast(*user_request);
+  }
 
   // Store request while waiting for votes
   {
@@ -370,6 +388,14 @@ int Commitment::Process2PCPrepare(std::unique_ptr<Context> context,
              << " received PREPARE for seq: " << seq
              << " from coordinator: " << coordinator_id;
 
+  // Cross-shard coordinator tags PREPARE with client_info; stash by hash until
+  // GLOBAL COMMIT drives local PBFT on this shard leader.
+  if (request->has_client_info() && !request->client_info().ip().empty()) {
+    std::lock_guard<std::mutex> lk(participant_twopc_mutex_);
+    participant_twopc_by_hash_[request->hash()] =
+        std::make_unique<Request>(*request);
+  }
+
   // Always vote YES (no aborts per assignment spec)
   Request vote;
   vote.set_type(Request::TYPE_2PC_VOTE);
@@ -381,7 +407,11 @@ int Commitment::Process2PCPrepare(std::unique_ptr<Context> context,
 
   LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
              << " voting YES for seq: " << seq;
-  replica_communicator_->SendMessage(vote, coordinator_id);
+  if (request->has_client_info() && !request->client_info().ip().empty()) {
+    replica_communicator_->SendMessage(vote, request->client_info());
+  } else {
+    replica_communicator_->SendMessage(vote, coordinator_id);
+  }
   return 0;
 }
 
@@ -399,7 +429,10 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
   {
     std::lock_guard<std::mutex> lk(twopc_mutex_);
     vote_count_[seq]++;
-    int num_participants = config_.GetReplicaNum() - 1;  // exclude coordinator
+    const int num_participants =
+        config_.GetCrossShardPeers().empty()
+            ? static_cast<int>(config_.GetReplicaNum()) - 1
+            : static_cast<int>(config_.GetCrossShardPeers().size());
     LOG(ERROR) << "[2PC] Vote count for seq " << seq << ": "
                << vote_count_[seq] << "/" << num_participants;
 
@@ -421,6 +454,12 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
     commit_msg.set_sender_id(config_.GetSelfInfo().id());
     commit_msg.set_current_view(message_manager_->GetCurrentView());
     commit_msg.set_hash(stored_request->hash());
+    const std::vector<ReplicaInfo> cross_peers = config_.GetCrossShardPeers();
+    if (!cross_peers.empty()) {
+      for (const auto& peer : cross_peers) {
+        replica_communicator_->SendMessage(commit_msg, peer);
+      }
+    }
     replica_communicator_->BroadCast(commit_msg);
 
     // === Now proceed with PBFT: broadcast PrePrepare ===
@@ -438,8 +477,42 @@ int Commitment::Process2PCCommit(std::unique_ptr<Context> context,
                                  std::unique_ptr<Request> request) {
   uint64_t seq = request->seq();
   LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
-             << " received GLOBAL COMMIT for seq: " << seq
-             << ". Awaiting PBFT PrePrepare.";
+             << " received GLOBAL COMMIT for seq: " << seq;
+
+  std::unique_ptr<Request> stashed;
+  const std::string commit_hash = request->hash();
+  {
+    std::lock_guard<std::mutex> lk(participant_twopc_mutex_);
+    auto it = participant_twopc_by_hash_.find(commit_hash);
+    if (it != participant_twopc_by_hash_.end()) {
+      stashed = std::move(it->second);
+      participant_twopc_by_hash_.erase(it);
+    }
+  }
+  if (!stashed) {
+    // Local replicas receive commit then PrePrepare from coordinator; no stash.
+    VLOG(1) << "[2PC] COMMIT without stashed prepare (expected on local backups).";
+    return 0;
+  }
+
+  auto local_seq = message_manager_->AssignNextSeq();
+  if (!local_seq.ok()) {
+    LOG(ERROR) << "[2PC] AssignNextSeq failed on participant shard";
+    {
+      std::lock_guard<std::mutex> lk(participant_twopc_mutex_);
+      participant_twopc_by_hash_[commit_hash] = std::move(stashed);
+    }
+    return -2;
+  }
+  LOG(ERROR) << "[2PC] Cross-shard participant " << config_.GetSelfInfo().id()
+             << " starting local PBFT (coordinator seq was " << seq
+             << ", local seq " << *local_seq << ")";
+  stashed->set_seq(*local_seq);
+  stashed->set_current_view(message_manager_->GetCurrentView());
+  stashed->set_sender_id(config_.GetSelfInfo().id());
+  stashed->set_primary_id(message_manager_->GetCurrentPrimary());
+  stashed->set_type(Request::TYPE_PRE_PREPARE);
+  replica_communicator_->BroadCast(*stashed);
   return 0;
 }
 

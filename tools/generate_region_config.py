@@ -44,9 +44,10 @@ def GenerateJsonConfig(file_name, output_file, template_file):
 
             tmp_config[region_id].append({"replica_info":info})
 
-    config = []
-    for region_data in tmp_config.values():
+    for rid in sorted(tmp_config.keys(), key=lambda x: int(x)):
+        region_data = tmp_config[rid]
         region = config_data.region.add()
+        region.region_id = int(rid)
         for rep in region_data:
             replica = Parse(json.dumps(rep["replica_info"]), ReplicaInfo())
             region.replica_info.append(replica)

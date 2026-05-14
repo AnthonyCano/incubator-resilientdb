@@ -31,6 +31,20 @@ TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
   socket_->SetRecvTimeout(timeout_ms_);
 }
 
+void TransactionConstructor::PickDestReplica() {
+  const std::vector<ReplicaInfo>& replicas = config_.GetReplicaInfos();
+  if (replicas.empty()) {
+    return;
+  }
+  if (config_.MultiShardClientRoundRobin() && replicas.size() > 1) {
+    const uint64_t round = proxy_send_round_.fetch_add(1, std::memory_order_relaxed);
+    const size_t idx = static_cast<size_t>(round % replicas.size());
+    NetChannel::SetDestReplicaInfo(replicas[idx]);
+  } else {
+    NetChannel::SetDestReplicaInfo(replicas[0]);
+  }
+}
+
 absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
     const Response& response) {
   std::string hash_;
@@ -62,15 +76,14 @@ absl::StatusOr<std::string> TransactionConstructor::GetResponseData(
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message, Request::Type type) {
-  // Use the replica obtained from the server.
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
+  PickDestReplica();
   return NetChannel::SendRequest(message, type, false);
 }
 
 int TransactionConstructor::SendRequest(
     const google::protobuf::Message& message,
     google::protobuf::Message* response, Request::Type type) {
-  NetChannel::SetDestReplicaInfo(config_.GetReplicaInfos()[0]);
+  PickDestReplica();
   int ret = NetChannel::SendRequest(message, type, true);
   if (ret == 0) {
     std::string resp_str;

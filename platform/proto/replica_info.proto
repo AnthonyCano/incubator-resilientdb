@@ -64,6 +64,16 @@ message ResConfigData{
   optional int32 max_client_complaint_num = 21;
 
   optional int32 duplicate_check_frequency_useconds = 22;
+
+  // When true, the client proxy (TransactionConstructor) round-robins each
+  // request across GetReplicaInfos()[i] (intended: one entry per shard leader).
+  optional bool multi_shard_client_round_robin = 25;
+
+  // Other shard leaders that participate in cross-shard 2PC with this shard
+  // (typically the three primaries not on this shard). When non-empty,
+  // Commitment runs 2PC across these peers before local PBFT; when empty,
+  // legacy intra-shard 2PC among local replicas is used.
+  repeated ReplicaInfo cross_shard_peer = 26;
 }
 
 message ReplicaStates {

@@ -121,6 +121,13 @@ class ResDBConfig {
   uint32_t GetViewchangeCommitTimeout() const;
   void SetViewchangeCommitTimeout(uint64_t timeout_ms);
 
+  // When set in client JSON (multi_shard_client_round_robin), the client proxy
+  // round-robins requests across listed shard leaders (one replica per shard).
+  bool MultiShardClientRoundRobin() const;
+
+  // Shard leaders on other shards for cross-shard 2PC (empty = intra-shard 2PC).
+  std::vector<ReplicaInfo> GetCrossShardPeers() const;
+
  private:
   ResConfigData config_data_;
   std::vector<ReplicaInfo> replicas_;

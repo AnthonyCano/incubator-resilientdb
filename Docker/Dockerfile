@@ -16,6 +16,10 @@
 # specific language governing permissions and limitations
 # under the License.
 #
+# Run the same image tag you built, e.g. after: docker build -f Docker/Dockerfile -t resdb:shared .
+#   docker rm -f resdb-shard
+#   docker run -d --name resdb-shard resdb:shared
+#
 
 FROM ubuntu:20.04
 
@@ -53,7 +57,9 @@ RUN sed -i 's/\r$//' .bazelversion 2>/dev/null || true \
     && find . -type f -name "*.sh" -exec sed -i 's/\r$//' {} + \
     && find scripts/deploy/config -maxdepth 1 -type f -name "*.conf" \
         -exec sed -i 's/\r$//' {} + \
-    && chmod +x entrypoint.sh service/tools/kv/server_tools/start_kv_service.sh
+    && chmod +x entrypoint.sh service/tools/kv/server_tools/start_kv_service.sh \
+        entrypoint_sharded.sh scripts/deploy/script/generate_sharded_configs.sh \
+        scripts/deploy/script/start_sharded_kv_cluster.sh
 
 # Build the project with Bazel 
 RUN bazel --version
@@ -64,4 +70,4 @@ RUN bazel build service/tools/kv/api_tools/kv_service_tools
 RUN apt-get update && apt-get install -y --no-install-recommends python3 psmisc \
     && rm -rf /var/lib/apt/lists/*
 
-ENTRYPOINT ["/bin/bash", "./entrypoint.sh"]
+ENTRYPOINT ["/bin/bash", "./entrypoint_sharded.sh"]

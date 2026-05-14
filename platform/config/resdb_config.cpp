@@ -253,4 +253,18 @@ void ResDBConfig::SetViewchangeCommitTimeout(uint64_t timeout_ms) {
   config_data_.set_view_change_timeout_ms(timeout_ms);
 }
 
+bool ResDBConfig::MultiShardClientRoundRobin() const {
+  return config_data_.has_multi_shard_client_round_robin() &&
+         config_data_.multi_shard_client_round_robin();
+}
+
+std::vector<ReplicaInfo> ResDBConfig::GetCrossShardPeers() const {
+  std::vector<ReplicaInfo> out;
+  out.reserve(static_cast<size_t>(config_data_.cross_shard_peer_size()));
+  for (const auto& p : config_data_.cross_shard_peer()) {
+    out.push_back(p);
+  }
+  return out;
+}
+
 }  // namespace resdb

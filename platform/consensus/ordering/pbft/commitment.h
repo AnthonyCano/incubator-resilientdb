@@ -90,6 +90,11 @@ class Commitment {
   std::mutex twopc_mutex_;
   std::map<uint64_t, int> vote_count_;  // seq -> number of votes received
   std::map<uint64_t, std::unique_ptr<Request>> pending_2pc_requests_;  // seq -> request waiting for votes
+
+  // Cross-shard 2PC: remote shard leaders stash PREPARE payload by txn hash until
+  // GLOBAL COMMIT, then drive local PBFT.
+  std::mutex participant_twopc_mutex_;
+  std::map<std::string, std::unique_ptr<Request>> participant_twopc_by_hash_;
 };
 
 }  // namespace resdb

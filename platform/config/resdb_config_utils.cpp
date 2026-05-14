@@ -201,8 +201,9 @@ std::unique_ptr<ResDBConfig> GenerateResDBConfig(
 }
 
 ResDBConfig GenerateResDBConfig(const std::string& config_file) {
+  ResConfigData config_data = ReadConfigFromFile(config_file);
   std::vector<ReplicaInfo> replicas = ReadConfig(config_file);
-  return ResDBConfig(replicas, ReplicaInfo());
+  return ResDBConfig(replicas, ReplicaInfo(), config_data);
 }
 
 }  // namespace resdb

@@ -1,0 +1,26 @@
+# Bazel creates root symlinks/junctions (bazel-app, bazel-bin, …). Docker Desktop
+# on Windows often errors with "invalid file request" when sending them as context.
+# The image runs `bazel build` inside the container; local Bazel outputs are not needed.
+bazel-app
+bazel-bin
+bazel-out
+bazel-testlogs
+bazel-*
+
+.git
+
+# Large or generated paths (aligns with .gitignore where sensible)
+**/node_modules
+**/__pycache__
+**/.cache
+venv
+sdk_validator/venv
+.idea
+.vscode
+*.log
+*.bak
+apache_release
+resdb
+100*_db
+.cache
+.history
