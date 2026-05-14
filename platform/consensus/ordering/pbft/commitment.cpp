@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "common/utils/utils.h"
+#include "interface/rdbc/net_channel.h"
 #include "platform/consensus/ordering/pbft/transaction_utils.h"
 
 namespace resdb {
@@ -152,12 +153,19 @@ int Commitment::ProcessNewRequest(std::unique_ptr<Context> context,
 
   if (!cross_peers.empty()) {
     // Cross-shard: other shard leaders vote; coordinator contact in client_info.
+    // The long-conn pool (replica_communicator_) routes to port+10000 and
+    // signs with the local shard's verifier, so it can't carry cross-shard
+    // traffic. Use a direct short-conn NetChannel to the peer's listener.
     for (const auto& peer : cross_peers) {
       Request prep;
       prep.CopyFrom(*user_request);
       prep.set_type(Request::TYPE_2PC_PREPARE);
       *prep.mutable_client_info() = coord_contact;
-      replica_communicator_->SendMessage(prep, peer);
+      LOG(ERROR) << "[2PC] sending PREPARE seq=" << *seq
+                 << " to peer id=" << peer.id() << " ip=" << peer.ip()
+                 << " port=" << peer.port();
+      NetChannel channel(peer.ip(), peer.port());
+      channel.SendRawMessage(prep);
     }
   } else {
     // Legacy intra-shard 2PC among local replicas.
@@ -408,7 +416,14 @@ int Commitment::Process2PCPrepare(std::unique_ptr<Context> context,
   LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
              << " voting YES for seq: " << seq;
   if (request->has_client_info() && !request->client_info().ip().empty()) {
-    replica_communicator_->SendMessage(vote, request->client_info());
+    // Cross-shard VOTE: short-conn NetChannel direct to the coordinator's
+    // listener, same reason as cross-shard PREPARE.
+    const auto& dest = request->client_info();
+    LOG(ERROR) << "[2PC] sending VOTE seq=" << seq
+               << " to coordinator id=" << dest.id() << " ip=" << dest.ip()
+               << " port=" << dest.port();
+    NetChannel channel(dest.ip(), dest.port());
+    channel.SendRawMessage(vote);
   } else {
     replica_communicator_->SendMessage(vote, coordinator_id);
   }
@@ -456,8 +471,14 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
     commit_msg.set_hash(stored_request->hash());
     const std::vector<ReplicaInfo> cross_peers = config_.GetCrossShardPeers();
     if (!cross_peers.empty()) {
+      // Cross-shard GLOBAL_COMMIT: direct NetChannel for the same reason as
+      // PREPARE/VOTE.
       for (const auto& peer : cross_peers) {
-        replica_communicator_->SendMessage(commit_msg, peer);
+        LOG(ERROR) << "[2PC] sending GLOBAL_COMMIT seq=" << seq
+                   << " to peer id=" << peer.id() << " ip=" << peer.ip()
+                   << " port=" << peer.port();
+        NetChannel channel(peer.ip(), peer.port());
+        channel.SendRawMessage(commit_msg);
       }
     }
     replica_communicator_->BroadCast(commit_msg);
@@ -512,6 +533,18 @@ int Commitment::Process2PCCommit(std::unique_ptr<Context> context,
   stashed->set_sender_id(config_.GetSelfInfo().id());
   stashed->set_primary_id(message_manager_->GetCurrentPrimary());
   stashed->set_type(Request::TYPE_PRE_PREPARE);
+  // The stashed request carries the coordinator shard's data_signature, which
+  // this shard's backups cannot verify. Re-sign the data with the local
+  // primary's verifier so backups accept the PRE_PREPARE during local PBFT.
+  if (verifier_) {
+    auto sig_or = verifier_->SignMessage(stashed->data());
+    if (!sig_or.ok()) {
+      LOG(ERROR) << "[2PC] Re-sign of cross-shard batch failed for hash "
+                 << commit_hash << "; skipping local PBFT";
+      return -2;
+    }
+    *stashed->mutable_data_signature() = *sig_or;
+  }
   replica_communicator_->BroadCast(*stashed);
   return 0;
 }

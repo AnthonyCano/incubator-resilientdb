@@ -35,6 +35,13 @@ using resdb::KVClient;
 using resdb::ReplicaInfo;
 using resdb::ResDBConfig;
 
+// SetClientTimeoutMs is applied as the TCP recv timeout in microseconds (see
+// TransactionConstructor). 100000 (~100ms) is too short for GET while PBFT and
+// optional cross-shard 2PC finish.
+namespace {
+constexpr int kKvToolsClientRecvTimeoutMicros = 30 * 100000;
+}  // namespace
+
 void ShowUsage() {
   printf(
       "--config: config path\n"
@@ -86,7 +93,7 @@ void OldAPI(char** argv) {
 
   ResDBConfig config = GenerateResDBConfig(client_config_file);
 
-  config.SetClientTimeoutMs(100000);
+  config.SetClientTimeoutMs(kKvToolsClientRecvTimeoutMicros);
 
   KVClient client(config);
 
@@ -174,7 +181,7 @@ int main(int argc, char** argv) {
 
   ResDBConfig config = GenerateResDBConfig(client_config_file);
 
-  config.SetClientTimeoutMs(100000);
+  config.SetClientTimeoutMs(kKvToolsClientRecvTimeoutMicros);
   KVClient client(config);
   if (cmd == "set_with_version") {
     if (key.empty() || value.empty() || version < 0) {

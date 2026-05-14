@@ -20,6 +20,9 @@
 #include "interface/rdbc/transaction_constructor.h"
 
 #include <glog/logging.h>
+#include <unistd.h>
+
+#include <chrono>
 
 namespace resdb {
 
@@ -29,6 +32,15 @@ TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
       timeout_ms_(
           config.GetClientTimeoutMs()) {  // default 2s for process timeout
   socket_->SetRecvTimeout(timeout_ms_);
+  // Seed proxy_send_round_ with a process-unique value so that short-lived
+  // client processes (e.g. kv_service_tools spawned once per SET) distribute
+  // across leaders instead of all picking replicas[0]. Without this seed a
+  // fresh process always starts at 0 and the in-process round-robin only
+  // works inside one long-lived session.
+  const uint64_t pid_bits = static_cast<uint64_t>(getpid());
+  const uint64_t time_bits = static_cast<uint64_t>(
+      std::chrono::steady_clock::now().time_since_epoch().count());
+  proxy_send_round_.store(pid_bits ^ time_bits, std::memory_order_relaxed);
 }
 
 void TransactionConstructor::PickDestReplica() {

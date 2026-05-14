@@ -105,6 +105,7 @@ cc_library(
         ":message_manager",
         ":response_manager",
         "//common/utils",
+        "//interface/rdbc:net_channel",
         "//platform/common/queue:batch_queue",
         "//platform/config:resdb_config",
         "//platform/consensus/execution:duplicate_manager",

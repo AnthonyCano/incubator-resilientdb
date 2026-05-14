@@ -68,7 +68,15 @@ void NetChannel::IsLongConnection(bool long_connect_tion) {
 int NetChannel::Connect() {
   socket_->ReInit();
   socket_->SetAsync(is_async_send_);
-  return socket_->Connect(ip_, port_);
+  int rc = socket_->Connect(ip_, port_);
+  if (rc != 0) {
+    return rc;
+  }
+  // ReInit() replaces the fd; re-apply timeouts (ctor-time SetRecvTimeout was
+  // lost). read_timeouts_ is in microseconds (see TransactionConstructor).
+  socket_->SetRecvTimeout(read_timeouts_);
+  socket_->SetSendTimeout(300);
+  return 0;
 }
 
 int NetChannel::SendDataInternal(const std::string& data) {

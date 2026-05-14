@@ -59,11 +59,18 @@ ResponseManager::ResponseManager(const ResDBConfig& config,
   local_id_ = 1;
   timeout_length_ = 5000000;
 
+  // The BatchProposeMsg drain thread also has to run on shard leaders that
+  // have cross-shard peers configured: in the sharded deployment there is no
+  // separate CLIENT-cert proxy, so without this gate widening the leader's
+  // batch_queue_ never drains and Commitment::ProcessNewRequest is never
+  // reached. Non-leader replicas never receive TYPE_CLIENT_REQUEST so their
+  // queue stays empty and the thread idles harmlessly.
   if (config_.GetPublicKeyCertificateInfo()
               .public_key()
               .public_key_info()
               .type() == CertificateKeyInfo::CLIENT ||
-      config_.IsTestMode()) {
+      config_.IsTestMode() ||
+      !config_.GetCrossShardPeers().empty()) {
     user_req_thread_ = std::thread(&ResponseManager::BatchProposeMsg, this);
   }
   if (config_.GetConfigData().enable_viewchange()) {

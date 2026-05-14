@@ -26,7 +26,8 @@
 set -e
 cd /app
 sed -i 's/\r$//' .bazelversion 2>/dev/null || true
-find scripts/deploy/script -name '*.sh' -exec sed -i 's/\r$//' {} + 2>/dev/null || true
+find scripts/deploy/script scripts/deploy/performance_local -name '*.sh' \
+  -exec sed -i 's/\r$//' {} + 2>/dev/null || true
 
 bazel build //service/kv:kv_service //tools:key_generator_tools //tools:certificate_tools
 

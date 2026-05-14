@@ -199,11 +199,11 @@ int ConsensusManagerPBFT::ConsensusCommit(std::unique_ptr<Context> context,
 
 int ConsensusManagerPBFT::InternalConsensusCommit(
     std::unique_ptr<Context> context, std::unique_ptr<Request> request) {
-  LOG(ERROR) << "recv impl type:" << request->type() << " "
-             << "sender id:" << request->sender_id()
-             << " seq:" << request->seq()
-             << " primary:" << system_info_->GetPrimaryId()
-             << " is convery:" << request->is_recovery();
+  VLOG(2) << "recv impl type:" << request->type() << " "
+          << "sender id:" << request->sender_id()
+          << " seq:" << request->seq()
+          << " primary:" << system_info_->GetPrimaryId()
+          << " is convery:" << request->is_recovery();
 
   switch (request->type()) {
     case Request::TYPE_CLIENT_REQUEST:

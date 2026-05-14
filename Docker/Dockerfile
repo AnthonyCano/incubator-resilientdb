@@ -59,7 +59,9 @@ RUN sed -i 's/\r$//' .bazelversion 2>/dev/null || true \
         -exec sed -i 's/\r$//' {} + \
     && chmod +x entrypoint.sh service/tools/kv/server_tools/start_kv_service.sh \
         entrypoint_sharded.sh scripts/deploy/script/generate_sharded_configs.sh \
-        scripts/deploy/script/start_sharded_kv_cluster.sh
+        scripts/deploy/script/start_sharded_kv_cluster.sh \
+        scripts/deploy/script/sharded_kv_performance.sh \
+        scripts/deploy/performance_local/sharded_performance_local.sh
 
 # Build the project with Bazel 
 RUN bazel --version

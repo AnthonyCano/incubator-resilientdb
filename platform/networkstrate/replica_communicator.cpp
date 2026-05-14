@@ -190,7 +190,9 @@ int ReplicaCommunicator::SendSingleMessage(
     single_bq_[std::make_pair(ip, port)]->Push(std::move(item));
     return 0;
   } else {
-    return SendMessageInternal(message, replicas_);
+    // Short-conn path must send to the explicit peer; the previous
+    // `replicas_` argument silently broadcast to the local shard.
+    return SendMessageInternal(message, {replica_info});
   }
 }
 
