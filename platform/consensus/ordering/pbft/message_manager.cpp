@@ -254,6 +254,13 @@ bool MessageManager::IsPreapared(uint64_t seq) {
   return collector_pool_->GetCollector(seq)->IsPrepared();
 }
 
+bool MessageManager::IsSeqCommitted(uint64_t seq) const {
+  if (!checkpoint_manager_) {
+    return false;
+  }
+  return checkpoint_manager_->IsCommitted(seq);
+}
+
 uint64_t MessageManager::GetHighestPreparedSeq() {
   return checkpoint_manager_->GetHighestPreparedSeq();
 }

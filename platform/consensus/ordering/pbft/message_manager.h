@@ -97,6 +97,8 @@ class MessageManager {
 
   bool IsPreapared(uint64_t seq);
 
+  bool IsSeqCommitted(uint64_t seq) const;
+
   uint64_t GetHighestPreparedSeq();
 
   void SetHighestPreparedSeq(uint64_t seq);

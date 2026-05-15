@@ -29,6 +29,14 @@ namespace resdb {
 
 // TransactionConstructor is a tool to access NesDB to send data and receive
 // data Inside TransactionConstructor, it does two things:
+//
+// Sharded mode: when ResDBConfig::MultiShardClientRoundRobin() is true and
+// multiple shard leaders are listed in GetReplicaInfos(), each outbound client
+// request picks the destination using a batch round-robin: the first
+// ClientBatchNum() requests go to the first leader, the next ClientBatchNum()
+// to the second, etc., wrapping after all leaders (see PickDestReplica).
+// A host-wide mmap counter backs the sequence so many short-lived client
+// processes (e.g. one kv_service_tools per SET) still advance routing fairly.
 class TransactionConstructor : public NetChannel {
  public:
   TransactionConstructor(const ResDBConfig& config);

@@ -25,6 +25,8 @@
 # Server/client JSON: scripts/deploy/config/sharded/ (committed).
 # CERT_DIR: directory that contains a cert/ subdir (default: .../config_out_sharded).
 # Prereq: run generate_sharded_configs.sh <WORKSPACE> <CERT_DIR's parent> once.
+# Optional: KV_START_STAGGER_SEC=0.2 (default) — delay between launching each replica
+# to reduce simultaneous huge malloc peaks (see sharded_kv_performance.sh).
 #
 set -eu
 
@@ -59,6 +61,9 @@ for idx in $(seq 1 16); do
   CRT="${CERT}/cert_${idx}.cert"
   nohup "${KV}" "${CFG}" "${PRI}" "${CRT}" >"${LOG_DIR}/kv_${idx}.log" 2>&1 &
   echo "Started node ${idx} (shard ${shard}) pid $!"
+  # Stagger starts so 16× huge LockFreeCollectorPools do not malloc simultaneously
+  # (avoids primaries stuck/OOM before listen — e.g. shard3 kv_9 on 18021).
+  sleep "${KV_START_STAGGER_SEC:-0.2}"
 done
 
 echo "All 16 kv_service processes launched. Logs: ${LOG_DIR}"

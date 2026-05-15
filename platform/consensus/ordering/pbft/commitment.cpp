@@ -19,7 +19,9 @@
 
 #include "platform/consensus/ordering/pbft/commitment.h"
 
+#include <chrono>
 #include <glog/logging.h>
+#include <thread>
 #include <unistd.h>
 
 #include "common/utils/utils.h"
@@ -47,10 +49,15 @@ Commitment::Commitment(const ResDBConfig& config,
       config_.GetSelfInfo().port(), config_.GetConfigData().enable_resview(),
       config_.GetConfigData().enable_faulty_switch());
   global_stats_->SetPrimaryId(message_manager_->GetCurrentPrimary());
+
+  twopc_watchdog_ = std::thread(&Commitment::TwoPCWatchdog, this);
 }
 
 Commitment::~Commitment() {
   stop_ = true;
+  if (twopc_watchdog_.joinable()) {
+    twopc_watchdog_.join();
+  }
   if (executed_thread_.joinable()) {
     executed_thread_.join();
   }
@@ -165,7 +172,12 @@ int Commitment::ProcessNewRequest(std::unique_ptr<Context> context,
                  << " to peer id=" << peer.id() << " ip=" << peer.ip()
                  << " port=" << peer.port();
       NetChannel channel(peer.ip(), peer.port());
-      channel.SendRawMessage(prep);
+      const int psend = channel.SendRawMessage(prep);
+      if (psend < 0) {
+        LOG(ERROR) << "[2PC] PREPARE send FAILED peer id=" << peer.id()
+                   << " ip=" << peer.ip() << " port=" << peer.port()
+                   << " seq=" << *seq << " (votes may never arrive; 2PC watchdog will timeout)";
+      }
     }
   } else {
     // Legacy intra-shard 2PC among local replicas.
@@ -178,8 +190,16 @@ int Commitment::ProcessNewRequest(std::unique_ptr<Context> context,
     std::lock_guard<std::mutex> lk(twopc_mutex_);
     user_request->set_type(Request::TYPE_PRE_PREPARE);  // restore for later PBFT use
     pending_2pc_requests_[*seq] = std::move(user_request);
-    vote_count_[*seq] = 0;
+    twopc_started_at_[*seq] = std::chrono::steady_clock::now();
+    twopc_voters_[*seq].clear();
   }
+
+  const int expect_votes =
+      cross_peers.empty() ? static_cast<int>(config_.GetReplicaNum()) - 1
+                          : static_cast<int>(cross_peers.size());
+  LOG(ERROR) << "[2PC] coordinator_replica_id=" << config_.GetSelfInfo().id()
+             << " expect_votes=" << expect_votes << " seq=" << *seq
+             << " cross_shard=" << (cross_peers.empty() ? 0 : 1);
 
   return 0;
 }
@@ -343,6 +363,13 @@ int Commitment::ProcessCommitMsg(std::unique_ptr<Context> context,
     return message_manager_->AddConsensusMsg(context->signature,
                                              std::move(request));
   }
+  // Duplicate COMMIT after seq is committed: AddConsensusMsg returns
+  // STATE_CHANGED (IsCommitted short-circuit), not INVALID; tests and
+  // callers expect -2 for invalid/duplicate commits.
+  if (message_manager_->IsSeqCommitted(seq)) {
+    LOG(ERROR) << " duplicate COMMIT for already-committed seq:" << seq;
+    return -2;
+  }
   // global_stats_->IncCommit();
   // Add request to message_manager.
   // If it has received enough same requests(2f+1), message manager will
@@ -416,14 +443,17 @@ int Commitment::Process2PCPrepare(std::unique_ptr<Context> context,
   LOG(ERROR) << "[2PC] Participant " << config_.GetSelfInfo().id()
              << " voting YES for seq: " << seq;
   if (request->has_client_info() && !request->client_info().ip().empty()) {
-    // Cross-shard VOTE: short-conn NetChannel direct to the coordinator's
-    // listener, same reason as cross-shard PREPARE.
     const auto& dest = request->client_info();
     LOG(ERROR) << "[2PC] sending VOTE seq=" << seq
                << " to coordinator id=" << dest.id() << " ip=" << dest.ip()
                << " port=" << dest.port();
     NetChannel channel(dest.ip(), dest.port());
-    channel.SendRawMessage(vote);
+    const int vsend = channel.SendRawMessage(vote);
+    if (vsend < 0) {
+      LOG(ERROR) << "[2PC] VOTE send FAILED to coordinator id=" << dest.id()
+                 << " ip=" << dest.ip() << " port=" << dest.port()
+                 << " seq=" << seq;
+    }
   } else {
     replica_communicator_->SendMessage(vote, coordinator_id);
   }
@@ -443,19 +473,30 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
 
   {
     std::lock_guard<std::mutex> lk(twopc_mutex_);
-    vote_count_[seq]++;
+    if (pending_2pc_requests_.find(seq) == pending_2pc_requests_.end()) {
+      LOG(WARNING) << "[2PC] VOTE for unknown or already-finished seq " << seq
+                   << " from " << voter_id;
+      return 0;
+    }
+    auto& voters = twopc_voters_[seq];
+    if (!voters.insert(voter_id).second) {
+      LOG(WARNING) << "[2PC] duplicate VOTE ignored seq=" << seq
+                   << " voter=" << voter_id;
+      return 0;
+    }
     const int num_participants =
         config_.GetCrossShardPeers().empty()
             ? static_cast<int>(config_.GetReplicaNum()) - 1
             : static_cast<int>(config_.GetCrossShardPeers().size());
     LOG(ERROR) << "[2PC] Vote count for seq " << seq << ": "
-               << vote_count_[seq] << "/" << num_participants;
+               << static_cast<int>(voters.size()) << "/" << num_participants;
 
-    if (vote_count_[seq] >= num_participants) {
+    if (static_cast<int>(voters.size()) >= num_participants) {
       all_votes_received = true;
       stored_request = std::move(pending_2pc_requests_[seq]);
       pending_2pc_requests_.erase(seq);
-      vote_count_.erase(seq);
+      twopc_voters_.erase(seq);
+      twopc_started_at_.erase(seq);
     }
   }
 
@@ -478,7 +519,11 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
                    << " to peer id=" << peer.id() << " ip=" << peer.ip()
                    << " port=" << peer.port();
         NetChannel channel(peer.ip(), peer.port());
-        channel.SendRawMessage(commit_msg);
+        const int gsend = channel.SendRawMessage(commit_msg);
+        if (gsend < 0) {
+          LOG(ERROR) << "[2PC] GLOBAL_COMMIT send FAILED peer id=" << peer.id()
+                     << " ip=" << peer.ip() << " port=" << peer.port();
+        }
       }
     }
     replica_communicator_->BroadCast(commit_msg);
@@ -547,6 +592,64 @@ int Commitment::Process2PCCommit(std::unique_ptr<Context> context,
   }
   replica_communicator_->BroadCast(*stashed);
   return 0;
+}
+
+void Commitment::TwoPCWatchdog() {
+  constexpr std::chrono::seconds kTimeout(30);
+  while (!stop_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    if (stop_) {
+      break;
+    }
+    std::vector<uint64_t> timed_out;
+    {
+      std::lock_guard<std::mutex> lk(twopc_mutex_);
+      const auto now = std::chrono::steady_clock::now();
+      for (const auto& pr : pending_2pc_requests_) {
+        const uint64_t seq = pr.first;
+        auto ts_it = twopc_started_at_.find(seq);
+        if (ts_it != twopc_started_at_.end() &&
+            now - ts_it->second > kTimeout) {
+          timed_out.push_back(seq);
+        }
+      }
+    }
+    for (uint64_t seq : timed_out) {
+      Timeout2PC(seq);
+    }
+  }
+}
+
+void Commitment::Timeout2PC(uint64_t seq) {
+  std::unique_ptr<Request> req;
+  std::string hash;
+  int proxy_id = 0;
+  {
+    std::lock_guard<std::mutex> lk(twopc_mutex_);
+    auto it = pending_2pc_requests_.find(seq);
+    if (it == pending_2pc_requests_.end()) {
+      return;
+    }
+    req = std::move(it->second);
+    pending_2pc_requests_.erase(it);
+    twopc_voters_.erase(seq);
+    twopc_started_at_.erase(seq);
+    hash = req->hash();
+    proxy_id = req->proxy_id();
+  }
+  duplicate_manager_->EraseProposed(hash);
+  global_stats_->SeqFail();
+  Request err;
+  err.set_type(Request::TYPE_RESPONSE);
+  err.set_sender_id(config_.GetSelfInfo().id());
+  err.set_proxy_id(proxy_id);
+  err.set_ret(-2);
+  err.set_hash(hash);
+  err.set_seq(seq);
+  LOG(ERROR) << "[2PC] TIMEOUT waiting for votes seq=" << seq
+             << " proxy_id=" << proxy_id
+             << " — sending error response so client unblocks";
+  replica_communicator_->SendMessage(err, err.proxy_id());
 }
 
 }  // namespace resdb

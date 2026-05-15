@@ -23,4 +23,12 @@ resdb/
 100*_db/
 gmon.out
 .history/
-service/tools/data/cert
+
+# Certificates and keys (local/generated deploy; keep platform/test/test_data)
+scripts/deploy/data/cert/
+scripts/deploy/resilientdb_app/
+ecosystem/graphql/service/tools/data/cert/
+service/tools/data/cert/
+**/cert/*.key.pri
+**/cert/*.key.pub
+**/cert/*.cert

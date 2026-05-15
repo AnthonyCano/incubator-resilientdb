@@ -21,7 +21,11 @@
 # pbft_performance.sh + run_performance.sh, but for the 4x4 shard layout
 # started by scripts/deploy/script/start_sharded_kv_cluster.sh.
 #
-# Prerequisite: 16x kv_service already running (e.g. Docker entrypoint_sharded).
+# Prerequisite for BENCH with AUTO_START_CLUSTER=1 (default): certs under
+# CERT_DIR/cert/ (see generate_sharded_configs.sh). The script starts 16
+# kv_service, warms up, runs the bench, analyzes logs, cools down, then kills
+# replicas (trap also kills on failure). Set AUTO_START_CLUSTER=0 if the
+# cluster is already running.
 #
 # Usage from repository root:
 #   bash scripts/deploy/performance_local/sharded_performance_local.sh [OPS] [CERT_DIR]
@@ -34,9 +38,14 @@
 #   PIN_CLIENT=1|0   DO_GET=1|0
 #   DIAG=1                                  — one SET + one GET with stderr
 #                                             visible, plus a kv_1.log summary.
-#   BENCH=1 [DURATION=60] [CONCURRENCY=8]   — parallel flood, then run
-#                                             calculate_result.py over the
-#                                             shard-leader logs (txn / latency).
+#   BENCH=1 [DURATION=60] [CONCURRENCY=8]   — auto-starts 16 replicas (default),
+#                                             warmup, bench, four per-shard
+#                                             coordinator throughput reports, stop.
+#   AUTO_START_CLUSTER=0                    — skip start/stop; use existing cluster.
+#   CLUSTER_READY_WAIT CLUSTER_WARMUP_SEC (default 20) COORDINATOR_LISTEN_WAIT_SEC (default 120)
+#   POST_BENCH_STATS_WAIT COOLDOWN_SEC
+#   KV_SERVICE_TOOLS SKIP_KV_SERVICE_TOOLS_BUILD — see sharded_kv_performance.sh
+#   (default: bazel build then binary under `bazel info bazel-bin`).
 #   See scripts/deploy/script/sharded_kv_performance.sh for full details.
 #
 # Example: 60s benchmark with 16 concurrent client loops:

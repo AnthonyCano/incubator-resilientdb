@@ -19,12 +19,59 @@
 
 #include "interface/rdbc/transaction_constructor.h"
 
+#include <fcntl.h>
 #include <glog/logging.h>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #include <chrono>
+#include <cerrno>
+#include <cstring>
+#include <mutex>
 
 namespace resdb {
+
+namespace {
+
+// kv_service_tools runs one process per SET in the shell bench; each process
+// only called PickDestReplica once, so a per-process counter made
+// (n / clientBatchNum) % num_shards depend on (pid^time) and could systematically
+// starve a shard. A tiny shared counter in a mmap'd file gives one global
+// sequence across all short-lived clients on this host (Linux/WSL).
+constexpr char kShardedClientSeqPath[] = "/tmp/resdb_sharded_client_send_seq";
+
+std::atomic<uint64_t>* MmappedGlobalSendSeq() {
+  static std::atomic<uint64_t>* ptr = nullptr;
+  static std::mutex init_mu;
+  std::lock_guard<std::mutex> lk(init_mu);
+  if (ptr != nullptr) {
+    return ptr;
+  }
+  int fd = open(kShardedClientSeqPath, O_RDWR | O_CREAT, 0666);
+  if (fd < 0) {
+    LOG(WARNING) << "open " << kShardedClientSeqPath << " failed: "
+                 << strerror(errno);
+    return nullptr;
+  }
+  if (ftruncate(fd, sizeof(uint64_t)) != 0) {
+    LOG(WARNING) << "ftruncate " << kShardedClientSeqPath << " failed: "
+                 << strerror(errno);
+    close(fd);
+    return nullptr;
+  }
+  void* mem =
+      mmap(nullptr, sizeof(uint64_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);
+  if (mem == MAP_FAILED) {
+    LOG(WARNING) << "mmap " << kShardedClientSeqPath << " failed: "
+                 << strerror(errno);
+    return nullptr;
+  }
+  ptr = reinterpret_cast<std::atomic<uint64_t>*>(mem);
+  return ptr;
+}
+
+}  // namespace
 
 TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
     : NetChannel("", 0),
@@ -32,11 +79,7 @@ TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
       timeout_ms_(
           config.GetClientTimeoutMs()) {  // default 2s for process timeout
   socket_->SetRecvTimeout(timeout_ms_);
-  // Seed proxy_send_round_ with a process-unique value so that short-lived
-  // client processes (e.g. kv_service_tools spawned once per SET) distribute
-  // across leaders instead of all picking replicas[0]. Without this seed a
-  // fresh process always starts at 0 and the in-process round-robin only
-  // works inside one long-lived session.
+  // Seed proxy_send_round_ for non-sharded or mmap-fallback routing.
   const uint64_t pid_bits = static_cast<uint64_t>(getpid());
   const uint64_t time_bits = static_cast<uint64_t>(
       std::chrono::steady_clock::now().time_since_epoch().count());
@@ -49,8 +92,26 @@ void TransactionConstructor::PickDestReplica() {
     return;
   }
   if (config_.MultiShardClientRoundRobin() && replicas.size() > 1) {
-    const uint64_t round = proxy_send_round_.fetch_add(1, std::memory_order_relaxed);
-    const size_t idx = static_cast<size_t>(round % replicas.size());
+    // Assignment-style routing: consecutive batches of clientBatchNum() sends
+    // go to shard leaders 0,1,2,3,... in order. Uses a host-wide counter so
+    // many short-lived kv_service_tools processes still advance the same
+    // sequence (see MmappedGlobalSendSeq).
+    uint32_t batch_size = config_.ClientBatchNum();
+    if (batch_size < 1u) {
+      batch_size = 1u;
+    }
+    uint64_t n = 0;
+    if (std::atomic<uint64_t>* g = MmappedGlobalSendSeq()) {
+      n = g->fetch_add(1, std::memory_order_relaxed);
+    } else {
+      n = proxy_send_round_.fetch_add(1, std::memory_order_relaxed);
+    }
+    const size_t idx = static_cast<size_t>(
+        (n / static_cast<uint64_t>(batch_size)) % replicas.size());
+    LOG(INFO) << "[proxy] batch_rr idx=" << idx
+              << " leader_replica_id=" << replicas[idx].id()
+              << " ip=" << replicas[idx].ip() << " port=" << replicas[idx].port()
+              << " send_seq=" << n << " clientBatchNum=" << batch_size;
     NetChannel::SetDestReplicaInfo(replicas[idx]);
   } else {
     NetChannel::SetDestReplicaInfo(replicas[0]);

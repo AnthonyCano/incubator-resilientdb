@@ -23,10 +23,11 @@
 #   correctness (default) — N (SET, GET) pairs, count successes/failures.
 #   DIAG=1                — single SET + single GET with stderr visible, plus
 #                           a leader-log summary so you can see what is wrong.
-#   BENCH=1               — parallel SET flood for DURATION seconds, then
-#                           run calculate_result.py over shard-leader logs to
-#                           print max/avg throughput and avg client latency
-#                           (same approach pbft_performance.sh uses).
+#   BENCH=1               — by default: start 16 replicas, readiness wait,
+#                           cluster warmup, parallel SET flood for DURATION,
+#                           stats wait, per-shard coordinator throughput (four
+#                           calculate_result.py runs on primaries 1,5,9,13),
+#                           cooldown, killall kv_service (trap cleans up on exit).
 #
 # Usage:
 #   ./sharded_kv_performance.sh <WORKSPACE_ROOT> [OPS] [CERT_DIR]
@@ -48,22 +49,59 @@
 #   BENCH=1                — throughput/latency benchmark mode.
 #   DURATION=60 (default)  — bench wall-clock seconds.
 #   CONCURRENCY=8 (default)— number of parallel kv_service_tools driver loops.
-#   BENCH_WARMUP=5 (default) seconds discarded from the start of each leader
-#                            log before calculate_result.py runs (the first
+#   BENCH_WARMUP=5 (default) seconds discarded from the start of each replica
+#                            log slice before calculate_result.py runs (the first
 #                            stats window often shows TPS=0).
+#
+#   BENCH lifecycle (BENCH=1 only):
+#   AUTO_START_CLUSTER=1 (default) — run start_sharded_kv_cluster.sh, then wait
+#                            for replicas, cluster warmup, bench, log analysis,
+#                            cooldown, killall kv_service. Set 0 if you start
+#                            the cluster yourself.
+#   CLUSTER_READY_WAIT=90 — max seconds to wait for 16 kv_service after start.
+#   CLUSTER_WARMUP_SEC=20 (default) — short settle after primaries listen; raise
+#                            if you still see unstable first stats windows.
+#   COORDINATOR_LISTEN_WAIT_SEC=120 — after 16 PIDs appear, wait until TCP
+#                            accepts on 18001/18011/18021/18031 (shard primaries).
+#                            If this times out, a replica likely OOM/hung during
+#                            huge LockFreeCollectorPool init; lower maxProcessTxn
+#                            or increase start_sharded KV_START_STAGGER_SEC.
+#   POST_BENCH_STATS_WAIT=5 — sleep after client loop so last stats lines flush.
+#   COOLDOWN_SEC=5 — sleep after calculate_result.py before killing replicas.
+#
+#   KV_SERVICE_TOOLS=/abs/path/kv_service_tools — use this client binary and
+#                            skip `bazel build` for it (path may be relative to
+#                            WORKSPACE if not absolute).
+#   SKIP_KV_SERVICE_TOOLS_BUILD=1 — when KV_SERVICE_TOOLS is unset, do not run
+#                            bazel build; use existing binary under
+#                            `$(bazel info bazel-bin)` (or ${WORKSPACE}/bazel-bin).
+#
+# Assignment alignment (sharded 2PC + PBFT):
+#   • Fixed 4 shards × 4 replicas: server JSON under scripts/deploy/config/sharded/.
+#   • Proxy batch round-robin: TransactionConstructor + clientBatchNum in
+#     client.shard_leaders.config (multiShardClientRoundRobin=true).
+#   • Coordinator = PBFT primary that receives the client batch; 2PC to
+#     crossShardPeer leaders; PBFT after GLOBAL_COMMIT — platform/consensus/
+#     ordering/pbft/commitment.cpp.
+#   • Client replies follow existing ResDB response path (see assignment options
+#     in the handout if you need only the coordinator shard to answer).
 #
 # Outputs (fixed names — every run overwrites the previous one):
 #   $CERT_DIR/logs/sharded_perf.txt              — run log
 #   $CERT_DIR/logs/sharded_perf_2pc.txt          — [2PC] log snippets
 #   BENCH mode also writes:
-#   $CERT_DIR/logs/sharded_bench_kv_{1,5,9,13}.slice  — log slices
-#   $CERT_DIR/logs/sharded_bench_results.log          — calculate_result.py
+#   $CERT_DIR/logs/sharded_bench_kv_{1,5,9,13}.slice — coordinator-primary slices
+#   $CERT_DIR/logs/sharded_bench_results.log         — combined four-shard report
+#   $CERT_DIR/logs/sharded_bench_shard{1..4}_results.log — one file per shard
 #
 set -eu
 
 WORKSPACE=$(cd "$1" && pwd)
 OPS="${2:-100}"
-CERT_ROOT=$(cd "${3:-${WORKSPACE}/scripts/deploy/config_out_sharded}" && pwd)
+CERT_ROOT_DEFAULT="${WORKSPACE}/scripts/deploy/config_out_sharded"
+CERT_IN="${3:-${CERT_ROOT_DEFAULT}}"
+mkdir -p "${CERT_IN}"
+CERT_ROOT=$(cd "${CERT_IN}" && pwd)
 LOG_DIR="${CERT_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
@@ -74,6 +112,7 @@ rm -f \
   "${LOG_DIR}"/sharded_perf_*.txt \
   "${LOG_DIR}"/sharded_bench_*.slice \
   "${LOG_DIR}"/sharded_bench_*_results.log \
+  "${LOG_DIR}"/sharded_bench_results.log \
   "${LOG_DIR}"/client.shard_leaders.bench.*.config \
   "${LOG_DIR}"/client.shard_leaders.perf.*.config \
   2>/dev/null || true
@@ -87,6 +126,14 @@ BENCH="${BENCH:-0}"
 DURATION="${DURATION:-60}"
 CONCURRENCY="${CONCURRENCY:-8}"
 BENCH_WARMUP="${BENCH_WARMUP:-5}"
+AUTO_START_CLUSTER="${AUTO_START_CLUSTER:-1}"
+CLUSTER_READY_WAIT="${CLUSTER_READY_WAIT:-90}"
+CLUSTER_WARMUP_SEC="${CLUSTER_WARMUP_SEC:-20}"
+COORDINATOR_LISTEN_WAIT_SEC="${COORDINATOR_LISTEN_WAIT_SEC:-120}"
+POST_BENCH_STATS_WAIT="${POST_BENCH_STATS_WAIT:-5}"
+COOLDOWN_SEC="${COOLDOWN_SEC:-5}"
+
+auto_started_kv=0
 
 CALC_PY="${WORKSPACE}/scripts/deploy/performance_local/calculate_result.py"
 
@@ -96,20 +143,56 @@ if [[ ! -f "${CLIENT_SRC}" ]]; then
 fi
 
 cd "${WORKSPACE}"
-bazel build //service/tools/kv/api_tools:kv_service_tools
 
-TOOL="${WORKSPACE}/bazel-bin/service/tools/kv/api_tools/kv_service_tools"
+BAZEL_BIN_FALLBACK="${WORKSPACE}/bazel-bin"
+KV_REL_BIN="service/tools/kv/api_tools/kv_service_tools"
+
+if [[ -n "${KV_SERVICE_TOOLS:-}" ]]; then
+  kv_in="${KV_SERVICE_TOOLS}"
+  case "${kv_in}" in
+    /*) ;;
+    *) kv_in="${WORKSPACE}/${kv_in}" ;;
+  esac
+  if [[ ! -x "${kv_in}" ]]; then
+    echo "KV_SERVICE_TOOLS is missing or not executable: ${kv_in}" >&2
+    exit 1
+  fi
+  TOOL="$(cd "$(dirname "${kv_in}")" && pwd)/$(basename "${kv_in}")"
+elif [[ "${SKIP_KV_SERVICE_TOOLS_BUILD:-0}" == "1" ]]; then
+  BAZEL_BIN="$(bazel info bazel-bin 2>/dev/null || true)"
+  if [[ -z "${BAZEL_BIN}" ]]; then
+    BAZEL_BIN="${BAZEL_BIN_FALLBACK}"
+  fi
+  TOOL="${BAZEL_BIN}/${KV_REL_BIN}"
+  if [[ ! -x "${TOOL}" ]]; then
+    echo "SKIP_KV_SERVICE_TOOLS_BUILD=1 but binary not found: ${TOOL}" >&2
+    exit 1
+  fi
+else
+  bazel build //service/tools/kv/api_tools:kv_service_tools
+  BAZEL_BIN="$(bazel info bazel-bin 2>/dev/null || true)"
+  if [[ -z "${BAZEL_BIN}" ]]; then
+    BAZEL_BIN="${BAZEL_BIN_FALLBACK}"
+  fi
+  TOOL="${BAZEL_BIN}/${KV_REL_BIN}"
+  if [[ ! -x "${TOOL}" ]]; then
+    echo "Expected kv_service_tools after build: ${TOOL}" >&2
+    exit 1
+  fi
+fi
+
 RUN_LOG="${LOG_DIR}/sharded_perf.txt"
 SNIP_LOG="${LOG_DIR}/sharded_perf_2pc.txt"
 # Truncate fixed-name outputs so the new run starts from a clean slate.
 : >"${RUN_LOG}"
 : >"${SNIP_LOG}"
+echo "kv_service_tools: ${TOOL}" | tee -a "${RUN_LOG}"
 
 # Pinned client config (single leader) is useful for correctness + diag.
-# For BENCH we want all four leaders driven concurrently. The in-process
-# round-robin counter in TransactionConstructor is now seeded by
-# (pid ^ steady_clock_ns), so even fork-per-set drivers distribute across
-# leaders. We just hand every concurrent slot the same round-robin config.
+# For BENCH we want all four leaders driven concurrently. With
+# multiShardClientRoundRobin=true, TransactionConstructor uses a host-wide mmap
+# send counter so one short-lived process per SET still rotates shard leaders;
+# every concurrent bench slot uses the same client JSON.
 if [[ "${BENCH}" == "1" ]]; then
   CLIENT_USE="${LOG_DIR}/client.shard_leaders.bench.config"
   sed 's/"multiShardClientRoundRobin": false/"multiShardClientRoundRobin": true/' \
@@ -133,7 +216,25 @@ cleanup_client_config() {
       ;;
   esac
 }
-trap cleanup_client_config EXIT
+
+stop_kv_if_auto_started() {
+  if [[ "${auto_started_kv}" -eq 1 ]]; then
+    echo "Stopping kv_service (auto-started cluster)..." >&2
+    if command -v killall >/dev/null 2>&1; then
+      killall -9 kv_service 2>/dev/null || true
+    else
+      pkill -9 -f kv_service 2>/dev/null || true
+    fi
+    auto_started_kv=0
+  fi
+}
+
+cleanup_on_exit() {
+  cleanup_client_config
+  stop_kv_if_auto_started
+}
+
+trap cleanup_on_exit EXIT
 
 extract_2pc_snippets() {
   local out="$1"
@@ -159,6 +260,37 @@ leader_log_size() {
   else
     echo 0
   fi
+}
+
+# PBFT primary listen ports for shards 1–4 (see server/shard*.server.config).
+primary_port_open() {
+  local port="$1"
+  if command -v nc >/dev/null 2>&1; then
+    nc -z -w1 127.0.0.1 "${port}" >/dev/null 2>&1
+    return $?
+  fi
+  # Bash built-in TCP (common on Linux/WSL).
+  timeout 0.4 bash -c "exec 3<>/dev/tcp/127.0.0.1/${port}" >/dev/null 2>&1
+}
+
+wait_coordinator_primary_ports() {
+  local max_wait="$1"
+  local ports=(18001 18011 18021 18031)
+  local deadline=$(($(date +%s) + max_wait))
+  while [[ "$(date +%s)" -lt "${deadline}" ]]; do
+    local ok=1
+    for p in "${ports[@]}"; do
+      if ! primary_port_open "${p}"; then
+        ok=0
+        break
+      fi
+    done
+    if [[ "${ok}" -eq 1 ]]; then
+      return 0
+    fi
+    sleep 0.5
+  done
+  return 1
 }
 
 # ------------------------------------------------------------------ DIAG mode
@@ -197,17 +329,69 @@ fi
 
 # ----------------------------------------------------------------- BENCH mode
 if [[ "${BENCH}" == "1" ]]; then
+  START_SH="${WORKSPACE}/scripts/deploy/script/start_sharded_kv_cluster.sh"
   RESULT_LOG="${LOG_DIR}/sharded_bench_results.log"
   : >"${RESULT_LOG}"
   echo "BENCH duration=${DURATION}s concurrency=${CONCURRENCY} log=${RUN_LOG}" \
     | tee -a "${RUN_LOG}"
+  echo "AUTO_START_CLUSTER=${AUTO_START_CLUSTER} CLUSTER_READY_WAIT=${CLUSTER_READY_WAIT} COORDINATOR_LISTEN_WAIT_SEC=${COORDINATOR_LISTEN_WAIT_SEC} CLUSTER_WARMUP_SEC=${CLUSTER_WARMUP_SEC} POST_BENCH_STATS_WAIT=${POST_BENCH_STATS_WAIT} COOLDOWN_SEC=${COOLDOWN_SEC}" \
+    | tee -a "${RUN_LOG}"
 
+  if [[ "${AUTO_START_CLUSTER}" == "1" ]]; then
+    if [[ ! -d "${CERT_ROOT}/cert" ]]; then
+      echo "Missing ${CERT_ROOT}/cert. Run:" >&2
+      echo "  bash scripts/deploy/script/generate_sharded_configs.sh \"\$(pwd)\" \"\$(pwd)/scripts/deploy/config_out_sharded\" 127.0.0.1" >&2
+      exit 1
+    fi
+    echo "Starting 16 kv_service replicas..." | tee -a "${RUN_LOG}"
+    bash "${START_SH}" "${WORKSPACE}" "${CERT_ROOT}"
+    auto_started_kv=1
+
+    echo "Waiting up to ${CLUSTER_READY_WAIT}s for 16 kv_service processes..." \
+      | tee -a "${RUN_LOG}"
+    deadline=$(($(date +%s) + CLUSTER_READY_WAIT))
+    while true; do
+      n="$(pgrep -f "${WORKSPACE}/bazel-bin/service/kv/kv_service" 2>/dev/null | wc -l | tr -d ' ')"
+      if [[ "${n}" -ge 16 ]]; then
+        echo "Detected ${n} kv_service process(es)." | tee -a "${RUN_LOG}"
+        break
+      fi
+      if [[ "$(date +%s)" -ge "${deadline}" ]]; then
+        echo "warn: gave up waiting for 16 kv_service (seen ${n}). Continuing." \
+          | tee -a "${RUN_LOG}"
+        break
+      fi
+      sleep 0.4
+    done
+
+    coord_wait="${COORDINATOR_LISTEN_WAIT_SEC}"
+    echo "Waiting up to ${coord_wait}s for coordinator listen ports 18001 18011 18021 18031..." \
+      | tee -a "${RUN_LOG}"
+    if wait_coordinator_primary_ports "${coord_wait}"; then
+      echo "All four shard-primary ports accepting TCP." | tee -a "${RUN_LOG}"
+    else
+      echo "warn: coordinator ports not all open within ${coord_wait}s (see kv_1 kv_5 kv_9 kv_13 logs; OOM/hang during pool init?)." \
+        | tee -a "${RUN_LOG}"
+    fi
+
+    if [[ "${CLUSTER_WARMUP_SEC}" -gt 0 ]]; then
+      echo "Cluster warmup ${CLUSTER_WARMUP_SEC}s..." | tee -a "${RUN_LOG}"
+      sleep "${CLUSTER_WARMUP_SEC}"
+    fi
+  else
+    echo "AUTO_START_CLUSTER=0: using already-running kv_service cluster." \
+      | tee -a "${RUN_LOG}"
+  fi
+
+  # Byte offsets for coordinator primaries only (replica ids 1,5,9,13).
   declare -A SIZE_BEFORE
   for id in 1 5 9 13; do
     SIZE_BEFORE[$id]=$(leader_log_size "$id")
   done
 
   t0=$(date +%s)
+  echo "BENCH client flood start wall=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    | tee -a "${RUN_LOG}"
   pids=()
   for j in $(seq 1 "${CONCURRENCY}"); do
     (
@@ -228,23 +412,24 @@ if [[ "${BENCH}" == "1" ]]; then
   for p in "${pids[@]}"; do
     wait "${p}" 2>/dev/null || true
   done
+  echo "BENCH client flood end wall=$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    | tee -a "${RUN_LOG}"
   t1=$(date +%s)
   elapsed=$((t1 - t0))
   if [[ "${elapsed}" -lt 1 ]]; then
     elapsed=1
   fi
 
-  echo "BENCH client loop done in ${elapsed}s. Waiting 5s for last stats window..." \
+  echo "BENCH client loop done in ${elapsed}s. Waiting ${POST_BENCH_STATS_WAIT}s for last stats window..." \
     | tee -a "${RUN_LOG}"
-  sleep 5
+  sleep "${POST_BENCH_STATS_WAIT}"
 
-  # Slice each leader's log: keep only bytes appended during the bench window
-  # (skip BENCH_WARMUP seconds-worth at the start because the first stats line
-  # is almost always a 0-tps cold sample).
-  RESULT_LOGS=()
+  # Slice coordinator-primary logs only (one PBFT primary / 2PC coordinator per shard).
+  SHARD_SLICES=()
   for id in 1 5 9 13; do
     f="${LOG_DIR}/kv_${id}.log"
     if [[ ! -f "${f}" ]]; then
+      echo "warn: missing ${f} (shard coordinator primary id=${id})" | tee -a "${RUN_LOG}"
       continue
     fi
     out="${LOG_DIR}/sharded_bench_kv_${id}.slice"
@@ -261,11 +446,11 @@ if [[ "${BENCH}" == "1" ]]; then
       # of lines by stripping the first matching stats line, conservatively.
       :
     fi
-    RESULT_LOGS+=("${out}")
+    SHARD_SLICES+=("${id}:${out}")
   done
 
-  if [[ "${#RESULT_LOGS[@]}" -eq 0 ]]; then
-    echo "BENCH: no leader log slices to analyze. Is the cluster running?" \
+  if [[ "${#SHARD_SLICES[@]}" -eq 0 ]]; then
+    echo "BENCH: no coordinator-primary log slices (kv_1/5/9/13). Is the cluster running?" \
       | tee -a "${RUN_LOG}"
     exit 1
   fi
@@ -275,20 +460,56 @@ if [[ "${BENCH}" == "1" ]]; then
     exit 1
   fi
 
-  echo "Running calculate_result.py over: ${RESULT_LOGS[*]}" | tee -a "${RUN_LOG}"
-  python3 "${CALC_PY}" "${RESULT_LOGS[@]}" >"${RESULT_LOG}" 2>&1 || true
   {
     echo ""
-    echo "======== bench summary ========"
+    echo "======== per-shard coordinator throughput (calculate_result.py each primary) ========"
     echo "duration_s=${elapsed} concurrency=${CONCURRENCY}"
-    echo "leader_log_slices: ${RESULT_LOGS[*]}"
-    echo "--- calculate_result.py ---"
-    cat "${RESULT_LOG}"
+    echo "Each block is the shard where that replica is PBFT primary / cross-shard 2PC coordinator for client-destined ops."
+    echo ""
+  } | tee -a "${RUN_LOG}" "${RESULT_LOG}"
+
+  shard_idx=0
+  for entry in "${SHARD_SLICES[@]}"; do
+    id="${entry%%:*}"
+    slice="${entry#*:}"
+    case "${id}" in
+      1) shard_idx=1 ;;
+      5) shard_idx=2 ;;
+      9) shard_idx=3 ;;
+      13) shard_idx=4 ;;
+      *) shard_idx="${id}" ;;
+    esac
+    shard_log="${LOG_DIR}/sharded_bench_shard${shard_idx}_results.log"
+    {
+      echo "=== Shard ${shard_idx} (coordinator primary replica_id=${id}) ==="
+      echo "slice: ${slice}"
+      python3 "${CALC_PY}" "${slice}"
+      echo ""
+    } | tee "${shard_log}" | tee -a "${RUN_LOG}" | tee -a "${RESULT_LOG}"
+  done
+
+  {
+    echo "======== bench summary (per-shard files) ========"
+    echo "combined: ${RESULT_LOG}"
+    for s in 1 2 3 4; do
+      f="${LOG_DIR}/sharded_bench_shard${s}_results.log"
+      [[ -f "${f}" ]] && echo "shard${s}: ${f}"
+    done
   } | tee -a "${RUN_LOG}"
 
   extract_2pc_snippets "${SNIP_LOG}"
   echo "2PC snippet file: ${SNIP_LOG}" | tee -a "${RUN_LOG}"
   echo "bench results: ${RESULT_LOG}" | tee -a "${RUN_LOG}"
+
+  if [[ "${auto_started_kv}" -eq 1 ]]; then
+    if [[ "${COOLDOWN_SEC}" -gt 0 ]]; then
+      echo "Cooldown ${COOLDOWN_SEC}s before stopping replicas..." | tee -a "${RUN_LOG}"
+      sleep "${COOLDOWN_SEC}"
+    fi
+    echo "Stopping kv_service (all replicas)..." | tee -a "${RUN_LOG}"
+    stop_kv_if_auto_started
+  fi
+
   exit 0
 fi
 

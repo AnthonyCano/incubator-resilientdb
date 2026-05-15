@@ -19,6 +19,13 @@
 
 #pragma once
 
+#include <chrono>
+#include <cstdint>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
+
 #include "platform/common/queue/batch_queue.h"
 #include "platform/config/resdb_config.h"
 #include "platform/consensus/execution/duplicate_manager.h"
@@ -88,8 +95,13 @@ class Commitment {
 
   // 2PC state
   std::mutex twopc_mutex_;
-  std::map<uint64_t, int> vote_count_;  // seq -> number of votes received
+  std::map<uint64_t, std::set<int64_t>> twopc_voters_;  // seq -> distinct voter ids
+  std::map<uint64_t, std::chrono::steady_clock::time_point> twopc_started_at_;
   std::map<uint64_t, std::unique_ptr<Request>> pending_2pc_requests_;  // seq -> request waiting for votes
+
+  std::thread twopc_watchdog_;
+  void TwoPCWatchdog();
+  void Timeout2PC(uint64_t seq);
 
   // Cross-shard 2PC: remote shard leaders stash PREPARE payload by txn hash until
   // GLOBAL COMMIT, then drive local PBFT.

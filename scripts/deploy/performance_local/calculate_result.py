@@ -63,7 +63,7 @@ def cal_lat(lat):
 
 if __name__ == '__main__':
     files = sys.argv[1:]
-    print("calculate results, number of nodes:",len(files))
+    print("calculate results, number of replica log files:", len(files))
 
 
     tps = []
