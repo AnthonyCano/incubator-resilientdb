@@ -23,6 +23,8 @@
 
 namespace resdb {
 
+std::atomic<uint64_t> TransactionConstructor::proxy_send_round_{0};
+
 TransactionConstructor::TransactionConstructor(const ResDBConfig& config)
     : NetChannel("", 0),
       config_(config),

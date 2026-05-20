@@ -63,7 +63,8 @@ ResponseManager::ResponseManager(const ResDBConfig& config,
               .public_key()
               .public_key_info()
               .type() == CertificateKeyInfo::CLIENT ||
-      config_.IsTestMode()) {
+      config_.IsTestMode() ||
+      !config_.GetCrossShardPeers().empty()) {
     user_req_thread_ = std::thread(&ResponseManager::BatchProposeMsg, this);
   }
   if (config_.GetConfigData().enable_viewchange()) {

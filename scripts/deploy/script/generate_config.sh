@@ -82,4 +82,5 @@ python3 ${CONFIG_TOOLS_BIN} ./server.config ./server.config.json ${TEMPLATE_PATH
 mv server.config.json server.config
 
 python3 ${CONFIG_TOOLS_BIN} ./client.config ./client.config.json
-mv client.config.json client.config
+python3 -c "import json,sys; d=json.load(open('client.config.json')); json.dump(d['region'][0], open('client.config','w'))"
+rm client.config.json

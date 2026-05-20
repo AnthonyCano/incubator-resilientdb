@@ -30,6 +30,15 @@ cc_binary(
 )
 
 cc_binary(
+    name = "kv_benchmark",
+    srcs = ["kv_benchmark.cpp"],
+    deps = [
+        "//interface/kv:kv_client",
+        "//platform/config:resdb_config_utils",
+    ],
+)
+
+cc_binary(
     name = "contract_service_tools",
     srcs = ["contract_service_tools.cpp"],
     deps = [

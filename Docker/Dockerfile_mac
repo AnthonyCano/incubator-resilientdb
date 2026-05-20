@@ -45,9 +45,21 @@ WORKDIR /app
 # Copy your project files to the container
 COPY . /app
 
+RUN sed -i 's/\r$//' .bazelversion 2>/dev/null || true \
+    && find . -type f -name "*.sh" -exec sed -i 's/\r$//' {} + \
+    && find scripts/deploy/config -maxdepth 1 -type f -name "*.conf" \
+        -exec sed -i 's/\r$//' {} + \
+    && chmod +x entrypoint.sh service/tools/kv/server_tools/start_kv_service.sh \
+        entrypoint_sharded.sh scripts/deploy/script/generate_sharded_configs.sh \
+        scripts/deploy/script/start_sharded_kv_cluster.sh
+
 # Build the project with Bazel
 RUN bazel --version
 RUN bazel build @com_github_bazelbuild_buildtools//buildifier:buildifier
 RUN bazel build service/tools/kv/api_tools/kv_service_tools
 
-ENTRYPOINT ["./entrypoint.sh"]
+# Deploy / performance scripts (performance_local/*.sh): python3 + killall from psmisc
+RUN apt-get update && apt-get install -y --no-install-recommends python3 psmisc \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["/bin/bash", "./entrypoint_sharded.sh"]

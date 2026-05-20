@@ -48,7 +48,10 @@ class TransactionConstructor : public NetChannel {
 
   ResDBConfig config_;
   int64_t timeout_ms_;  // microsecond for timeout.
-  std::atomic<uint64_t> proxy_send_round_{0};
+  // Static so all TransactionConstructor instances in one process share the
+  // round-robin pointer; otherwise N threads with N clients all start at 0
+  // and pile on the same shard leader.
+  static std::atomic<uint64_t> proxy_send_round_;
 };
 
 }  // namespace resdb

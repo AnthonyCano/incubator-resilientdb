@@ -19,6 +19,8 @@
 
 #pragma once
 
+#include <set>
+
 #include "platform/common/queue/batch_queue.h"
 #include "platform/config/resdb_config.h"
 #include "platform/consensus/execution/duplicate_manager.h"
@@ -88,7 +90,7 @@ class Commitment {
 
   // 2PC state
   std::mutex twopc_mutex_;
-  std::map<uint64_t, int> vote_count_;  // seq -> number of votes received
+  std::map<uint64_t, std::set<int64_t>> twopc_voters_;  // seq -> distinct voter ids
   std::map<uint64_t, std::unique_ptr<Request>> pending_2pc_requests_;  // seq -> request waiting for votes
 
   // Cross-shard 2PC: remote shard leaders stash PREPARE payload by txn hash until

@@ -190,7 +190,7 @@ int ReplicaCommunicator::SendSingleMessage(
     single_bq_[std::make_pair(ip, port)]->Push(std::move(item));
     return 0;
   } else {
-    return SendMessageInternal(message, replicas_);
+    return SendMessageInternal(message, {replica_info});
   }
 }
 
