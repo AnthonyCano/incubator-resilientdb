@@ -15,34 +15,55 @@
 # specific language governing permissions and limitations
 # under the License.    
 
-import sys
+import argparse
 
 def read_tps(file):
-    tps = []
+    samples = []
     lat = []
     with open(file) as f:
         for l in f.readlines():
             s = l.split()
+            txn = None
+            t = None
             for r in s:
-                if(r.split(':')[0] == 'txn'):
-                    tps.append(int(r.split(':')[1]))
+                k = r.split(':')[0]
+                if k == 'txn':
+                    txn = int(r.split(':')[1])
+                elif k == 'time':
+                    t = int(r.split(':')[1])
+            if txn is not None:
+                samples.append((txn, t))
             if l.find("client latency") > 0:
                 lat.append(float(s[-1].split(':')[-1]))
-    return tps, lat
+    return samples, lat
 
-def cal_tps(tps):
+def in_window(sample_time, warmup_sec, duration_sec):
+    if sample_time is None:
+        return True
+    if sample_time <= warmup_sec:
+        return False
+    if duration_sec > 0 and sample_time > duration_sec:
+        return False
+    return True
+
+def cal_tps(samples, warmup_sec, duration_sec):
     tps_sum = []
     tps_max = 0
+    kept = 0
 
-    for v in tps:
+    for v, sample_time in samples:
+        if not in_window(sample_time, warmup_sec, duration_sec):
+            continue
+        kept += 1
         if v == 0:
             continue
         tps_max = max(tps_max, v)
         tps_sum.append(v) 
 
     print("max throughput:",tps_max)
+    print("windowed samples:", kept)
     if not tps_sum:
-        print("average throughput: 0 (no txn samples in logs)")
+        print("average throughput: 0 (no txn samples in selected window)")
     else:
         print("average throughput:", sum(tps_sum) / len(tps_sum))
 
@@ -62,16 +83,23 @@ def cal_lat(lat):
         print("average latency:", sum(lat_sum) / len(lat_sum))
 
 if __name__ == '__main__':
-    files = sys.argv[1:]
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--warmup-sec', type=int, default=0,
+                        help='Exclude samples with time<=warmup-sec')
+    parser.add_argument('--duration-sec', type=int, default=0,
+                        help='Exclude samples with time>duration-sec (0 keeps all)')
+    parser.add_argument('files', nargs='+')
+    args = parser.parse_args()
+    files = args.files
     print("calculate results, number of replica log files:", len(files))
 
 
-    tps = []
+    samples = []
     lat = []
     for f in files:
-        t, l=read_tps(f)
-        tps += t
+        t, l = read_tps(f)
+        samples += t
         lat += l
 
-    cal_tps(tps)
+    cal_tps(samples, args.warmup_sec, args.duration_sec)
     cal_lat(lat)

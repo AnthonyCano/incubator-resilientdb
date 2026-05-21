@@ -30,51 +30,20 @@
 #                           cooldown, killall kv_service (trap cleans up on exit).
 #
 # Usage:
-#   ./sharded_kv_performance.sh <WORKSPACE_ROOT> [OPS] [CERT_DIR]
+#   ./sharded_kv_performance.sh [WORKSPACE_ROOT]
 #
-# From repo root (local, no SSH — same spirit as performance_local):
-#   bash scripts/deploy/performance_local/sharded_performance_local.sh [OPS] [CERT_DIR]
+# From repo root (local, no SSH — same fixed 60s / single client as
+# performance_local/run_performance.sh):
+#   bash scripts/deploy/performance_local/sharded_performance_local.sh
 #
-# Environment:
-#   PIN_CLIENT=1 (default) — copy client JSON with multiShardClientRoundRobin
-#             false so SET then GET on the same key hits the same leader.
-#   PIN_CLIENT=0           — use committed client.shard_leaders.config as-is.
-#   DO_GET=1 (default)     — after each SET, GET the same key.
-#   DO_GET=0               — SET only.
+# Fixed benchmark parameters (match run_performance.sh sleep 60 + one client):
+#   BENCH=1, DURATION=60, CONCURRENCY=1
 #
-#   DIAG=1                 — diagnostic: one SET + one GET with stderr captured
-#                            into the run log; also prints recent [2PC] lines
-#                            and the most recent stats lines from kv_1.log.
-#
-#   BENCH=1                — throughput/latency benchmark mode.
-#   DURATION=60 (default)  — bench wall-clock seconds.
-#   CONCURRENCY=8 (default)— number of parallel kv_service_tools driver loops.
-#   BENCH_WARMUP=5 (default) seconds discarded from the start of each replica
-#                            log slice before calculate_result.py runs (the first
-#                            stats window often shows TPS=0).
-#
-#   BENCH lifecycle (BENCH=1 only):
-#   AUTO_START_CLUSTER=1 (default) — run start_sharded_kv_cluster.sh, then wait
-#                            for replicas, cluster warmup, bench, log analysis,
-#                            cooldown, killall kv_service. Set 0 if you start
-#                            the cluster yourself.
-#   CLUSTER_READY_WAIT=90 — max seconds to wait for 16 kv_service after start.
-#   CLUSTER_WARMUP_SEC=20 (default) — short settle after primaries listen; raise
-#                            if you still see unstable first stats windows.
-#   COORDINATOR_LISTEN_WAIT_SEC=120 — after 16 PIDs appear, wait until TCP
-#                            accepts on 18001/18011/18021/18031 (shard primaries).
-#                            If this times out, a replica likely OOM/hung during
-#                            huge LockFreeCollectorPool init; lower maxProcessTxn
-#                            or increase start_sharded KV_START_STAGGER_SEC.
-#   POST_BENCH_STATS_WAIT=5 — sleep after client loop so last stats lines flush.
-#   COOLDOWN_SEC=5 — sleep after calculate_result.py before killing replicas.
-#
-#   KV_SERVICE_TOOLS=/abs/path/kv_service_tools — use this client binary and
-#                            skip `bazel build` for it (path may be relative to
-#                            WORKSPACE if not absolute).
-#   SKIP_KV_SERVICE_TOOLS_BUILD=1 — when KV_SERVICE_TOOLS is unset, do not run
-#                            bazel build; use existing binary under
-#                            `$(bazel info bazel-bin)` (or ${WORKSPACE}/bazel-bin).
+# Optional overrides (advanced only):
+#   DIAG=1                 — one SET + one GET diagnostic, then exit.
+#   BENCH=0                — correctness loop (100 SET/GET pairs) instead of bench.
+#   AUTO_START_CLUSTER=0   — cluster already running.
+#   KV_SERVICE_TOOLS, SKIP_KV_SERVICE_TOOLS_BUILD — client binary path.
 #
 # Assignment alignment (sharded 2PC + PBFT):
 #   • Fixed 4 shards × 4 replicas: server JSON under scripts/deploy/config/sharded/.
@@ -96,12 +65,11 @@
 #
 set -eu
 
-WORKSPACE=$(cd "$1" && pwd)
-OPS="${2:-100}"
-CERT_ROOT_DEFAULT="${WORKSPACE}/scripts/deploy/config_out_sharded"
-CERT_IN="${3:-${CERT_ROOT_DEFAULT}}"
-mkdir -p "${CERT_IN}"
-CERT_ROOT=$(cd "${CERT_IN}" && pwd)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$(cd "${1:-$(cd "${SCRIPT_DIR}/../../.." && pwd)}" && pwd)"
+CERT_ROOT="${WORKSPACE}/scripts/deploy/config_out_sharded"
+mkdir -p "${CERT_ROOT}"
+CERT_ROOT=$(cd "${CERT_ROOT}" && pwd)
 LOG_DIR="${CERT_ROOT}/logs"
 mkdir -p "${LOG_DIR}"
 
@@ -119,21 +87,23 @@ rm -f \
 
 STATIC_CFG="${WORKSPACE}/scripts/deploy/config/sharded"
 CLIENT_SRC="${STATIC_CFG}/client.shard_leaders.config"
-PIN_CLIENT="${PIN_CLIENT:-1}"
-DO_GET="${DO_GET:-1}"
+# Fixed defaults aligned with performance_local/run_performance.sh (60s, one client).
+PIN_CLIENT=1
+DO_GET=1
 DIAG="${DIAG:-0}"
-BENCH="${BENCH:-0}"
-DURATION="${DURATION:-60}"
-CONCURRENCY="${CONCURRENCY:-8}"
-BENCH_WARMUP="${BENCH_WARMUP:-5}"
+BENCH="${BENCH:-1}"
+DURATION=60
+CONCURRENCY=8
 AUTO_START_CLUSTER="${AUTO_START_CLUSTER:-1}"
-CLUSTER_READY_WAIT="${CLUSTER_READY_WAIT:-90}"
-CLUSTER_WARMUP_SEC="${CLUSTER_WARMUP_SEC:-20}"
-COORDINATOR_LISTEN_WAIT_SEC="${COORDINATOR_LISTEN_WAIT_SEC:-120}"
-POST_BENCH_STATS_WAIT="${POST_BENCH_STATS_WAIT:-5}"
-COOLDOWN_SEC="${COOLDOWN_SEC:-5}"
+CLUSTER_READY_WAIT=90
+CLUSTER_WARMUP_SEC=20
+COORDINATOR_LISTEN_WAIT_SEC=120
+POST_BENCH_STATS_WAIT=5
+COOLDOWN_SEC=5
+OPS=100
 
 auto_started_kv=0
+declare -A STARTUP_LOG_OFFSETS
 
 CALC_PY="${WORKSPACE}/scripts/deploy/performance_local/calculate_result.py"
 
@@ -293,6 +263,32 @@ wait_coordinator_primary_ports() {
   return 1
 }
 
+check_cluster_startup_health() {
+  local bad=0
+  for id in $(seq 1 16); do
+    local f="${LOG_DIR}/kv_${id}.log"
+    if [[ ! -f "${f}" ]]; then
+      echo "warn: missing startup log ${f}" | tee -a "${RUN_LOG}"
+      bad=1
+      continue
+    fi
+    local off="${STARTUP_LOG_OFFSETS[$id]:-0}"
+    local scan_file="${f}"
+    if [[ "${off}" -gt 0 ]]; then
+      scan_file="$(mktemp)"
+      tail -c +$((off + 1)) "${f}" >"${scan_file}" 2>/dev/null || true
+    fi
+    if grep -Eq "double free|corruption \\(out\\)|Segmentation fault|Aborted|terminate called" "${scan_file}" 2>/dev/null; then
+      echo "warn: unhealthy startup signal in ${f}" | tee -a "${RUN_LOG}"
+      bad=1
+    fi
+    if [[ "${scan_file}" != "${f}" ]]; then
+      rm -f "${scan_file}"
+    fi
+  done
+  return "${bad}"
+}
+
 # ------------------------------------------------------------------ DIAG mode
 if [[ "${DIAG}" == "1" ]]; then
   echo "OPS=${OPS} DIAG=1 log=${RUN_LOG}" | tee -a "${RUN_LOG}"
@@ -338,6 +334,9 @@ if [[ "${BENCH}" == "1" ]]; then
     | tee -a "${RUN_LOG}"
 
   if [[ "${AUTO_START_CLUSTER}" == "1" ]]; then
+    for id in $(seq 1 16); do
+      STARTUP_LOG_OFFSETS[$id]=$(leader_log_size "$id")
+    done
     if [[ ! -d "${CERT_ROOT}/cert" ]]; then
       echo "Missing ${CERT_ROOT}/cert. Run:" >&2
       echo "  bash scripts/deploy/script/generate_sharded_configs.sh \"\$(pwd)\" \"\$(pwd)/scripts/deploy/config_out_sharded\" 127.0.0.1" >&2
@@ -377,6 +376,10 @@ if [[ "${BENCH}" == "1" ]]; then
     if [[ "${CLUSTER_WARMUP_SEC}" -gt 0 ]]; then
       echo "Cluster warmup ${CLUSTER_WARMUP_SEC}s..." | tee -a "${RUN_LOG}"
       sleep "${CLUSTER_WARMUP_SEC}"
+    fi
+    if ! check_cluster_startup_health; then
+      echo "BENCH abort: cluster failed startup health checks." | tee -a "${RUN_LOG}"
+      exit 1
     fi
   else
     echo "AUTO_START_CLUSTER=0: using already-running kv_service cluster." \
@@ -441,11 +444,6 @@ if [[ "${BENCH}" == "1" ]]; then
       continue
     fi
     tail -c +$((off + 1)) "${f}" >"${out}"
-    if [[ "${BENCH_WARMUP}" -gt 0 ]]; then
-      # stats lines are emitted every 5s; drop the first (BENCH_WARMUP/5) blocks
-      # of lines by stripping the first matching stats line, conservatively.
-      :
-    fi
     SHARD_SLICES+=("${id}:${out}")
   done
 

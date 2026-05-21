@@ -163,6 +163,22 @@ bool MessageManager::MayConsensusChangeStatus(
             std::memory_order_acq_rel, std::memory_order_acq_rel);
       }
       break;
+    case Request::TYPE_PAXOS_LEARN:
+      // Good-case Paxos: one value-carrying LEARN from leader + replica acks.
+      if (*status == TransactionStatue::None) {
+        TransactionStatue old_status = TransactionStatue::None;
+        return status->compare_exchange_strong(
+            old_status, TransactionStatue::READY_PREPARE,
+            std::memory_order_acq_rel, std::memory_order_acq_rel);
+      }
+      if (*status == TransactionStatue::READY_PREPARE &&
+          config_.GetMinDataReceiveNum() <= received_count) {
+        TransactionStatue old_status = TransactionStatue::READY_PREPARE;
+        return status->compare_exchange_strong(
+            old_status, TransactionStatue::READY_EXECUTE,
+            std::memory_order_acq_rel, std::memory_order_acq_rel);
+      }
+      break;
   }
   return ret;
 }
@@ -189,8 +205,14 @@ CollectorResultCode MessageManager::AddConsensusMsg(
     return CollectorResultCode::STATE_CHANGED;
   }
 
+  const bool is_main_request =
+      type == Request::TYPE_PRE_PREPARE ||
+      (type == Request::TYPE_PAXOS_LEARN &&
+       request->sender_id() == GetCurrentPrimary() &&
+       !request->data().empty());
+
   int ret = collector_pool_->GetCollector(seq)->AddRequest(
-      std::move(request), signature, type == Request::TYPE_PRE_PREPARE,
+      std::move(request), signature, is_main_request,
       [&](const Request& request, int received_count,
           TransactionCollector::CollectorDataType* data,
           std::atomic<TransactionStatue>* status, bool force) {
@@ -200,16 +222,14 @@ CollectorResultCode MessageManager::AddConsensusMsg(
       });
   if (ret == 1) {
     SetLastCommittedTime(proxy_id);
+    if (checkpoint_manager_) {
+      checkpoint_manager_->AddCommitState(seq);
+    }
   } else if (ret != 0) {
     LOG(ERROR) << " add request fail";
     return CollectorResultCode::INVALID;
   }
   if (resp_received_count > 0) {
-    if (type == Request::TYPE_COMMIT) {
-      if (checkpoint_manager_) {
-        checkpoint_manager_->AddCommitState(seq);
-      }
-    }
     return CollectorResultCode::STATE_CHANGED;
   }
   return CollectorResultCode::OK;

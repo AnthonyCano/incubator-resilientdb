@@ -19,7 +19,7 @@
 
 #include "platform/consensus/ordering/pbft/commitment.h"
 
-#include <chrono>
+#include <cstdlib>
 #include <glog/logging.h>
 #include <thread>
 #include <unistd.h>
@@ -29,6 +29,13 @@
 #include "platform/consensus/ordering/pbft/transaction_utils.h"
 
 namespace resdb {
+
+namespace {
+bool UseLegacyPbftAfter2PC() {
+  const char* env = std::getenv("RESDB_USE_LEGACY_PBFT_AFTER_2PC");
+  return env != nullptr && std::string(env) == "1";
+}
+}  // namespace
 
 Commitment::Commitment(const ResDBConfig& config,
                        MessageManager* message_manager,
@@ -401,6 +408,9 @@ int Commitment::PostProcessExecutedMsg() {
     request.set_current_view(batch_resp->current_view());
     request.set_proxy_id(batch_resp->proxy_id());
     request.set_primary_id(batch_resp->primary_id());
+    if (batch_resp->proxy_id() <= 0) {
+      continue;
+    }
     LOG(ERROR) << "send back to proxy:" << batch_resp->proxy_id();
     batch_resp->SerializeToString(request.mutable_data());
     replica_communicator_->SendMessage(request, request.proxy_id());
@@ -526,13 +536,13 @@ int Commitment::Process2PCVote(std::unique_ptr<Context> context,
         }
       }
     }
-    replica_communicator_->BroadCast(commit_msg);
 
-    // === Now proceed with PBFT: broadcast PrePrepare ===
-    LOG(ERROR) << "[2PC] 2PC complete for seq: " << seq
-               << ". Starting PBFT consensus.";
-    stored_request->set_type(Request::TYPE_PRE_PREPARE);
-    replica_communicator_->BroadCast(*stored_request);
+    if (UseLegacyPbftAfter2PC()) {
+      stored_request->set_type(Request::TYPE_PRE_PREPARE);
+      replica_communicator_->BroadCast(*stored_request);
+    } else {
+      StartShardPaxos(std::move(stored_request));
+    }
   }
 
   return 0;
@@ -577,21 +587,29 @@ int Commitment::Process2PCCommit(std::unique_ptr<Context> context,
   stashed->set_current_view(message_manager_->GetCurrentView());
   stashed->set_sender_id(config_.GetSelfInfo().id());
   stashed->set_primary_id(message_manager_->GetCurrentPrimary());
-  stashed->set_type(Request::TYPE_PRE_PREPARE);
-  // The stashed request carries the coordinator shard's data_signature, which
-  // this shard's backups cannot verify. Re-sign the data with the local
-  // primary's verifier so backups accept the PRE_PREPARE during local PBFT.
+  // Cross-shard participants must not reply to client proxy; only the global
+  // 2PC coordinator shard should emit client responses.
+  stashed->set_proxy_id(0);
+  stashed->set_need_response(false);
   if (verifier_) {
     auto sig_or = verifier_->SignMessage(stashed->data());
     if (!sig_or.ok()) {
       LOG(ERROR) << "[2PC] Re-sign of cross-shard batch failed for hash "
-                 << commit_hash << "; skipping local PBFT";
+                 << commit_hash << "; skipping local Paxos";
+      {
+        std::lock_guard<std::mutex> lk(participant_twopc_mutex_);
+        participant_twopc_by_hash_[commit_hash] = std::move(stashed);
+      }
       return -2;
     }
     *stashed->mutable_data_signature() = *sig_or;
   }
-  replica_communicator_->BroadCast(*stashed);
-  return 0;
+  if (UseLegacyPbftAfter2PC()) {
+    stashed->set_type(Request::TYPE_PRE_PREPARE);
+    replica_communicator_->BroadCast(*stashed);
+    return 0;
+  }
+  return StartShardPaxos(std::move(stashed));
 }
 
 void Commitment::TwoPCWatchdog() {
@@ -650,6 +668,381 @@ void Commitment::Timeout2PC(uint64_t seq) {
              << " proxy_id=" << proxy_id
              << " — sending error response so client unblocks";
   replica_communicator_->SendMessage(err, err.proxy_id());
+}
+
+// ------------------------ Intra-shard Paxos (classic broadcast flow) ------------------------
+
+std::unique_ptr<Context> Commitment::ContextFromDataSignature(
+    const Request& request) {
+  auto ctx = std::make_unique<Context>();
+  if (request.has_data_signature() &&
+      !request.data_signature().signature().empty()) {
+    ctx->signature = request.data_signature();
+  } else {
+    ctx->signature.set_signature("paxos");
+  }
+  return ctx;
+}
+
+void Commitment::PaxosMaybeSendAccept(uint64_t seq) {
+  std::unique_ptr<Request> accept_msg;
+  uint64_t proposal = 0;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto it = paxos_leader_by_seq_.find(seq);
+    if (it == paxos_leader_by_seq_.end() || !it->second->pending_txn) {
+      return;
+    }
+    PaxosLeaderState& st = *it->second;
+    if (st.accept_sent) {
+      return;
+    }
+    if (static_cast<int>(st.promised_replicas.size()) <
+        config_.GetMinDataReceiveNum()) {
+      return;
+    }
+    st.accept_sent = true;
+    proposal = st.proposal_num;
+
+    accept_msg = std::make_unique<Request>(*st.pending_txn);
+    if (st.best_prior_n > 0 && !st.best_prior_value.empty()) {
+      accept_msg->set_data(st.best_prior_value);
+      if (verifier_) {
+        auto sig_or = verifier_->SignMessage(accept_msg->data());
+        if (sig_or.ok()) {
+          *accept_msg->mutable_data_signature() = *sig_or;
+        }
+      }
+      st.pending_txn->set_data(st.best_prior_value);
+      if (verifier_) {
+        auto sig2 = verifier_->SignMessage(st.pending_txn->data());
+        if (sig2.ok()) {
+          *st.pending_txn->mutable_data_signature() = *sig2;
+        }
+      }
+    }
+  }
+
+  accept_msg->set_type(Request::TYPE_PAXOS_ACCEPT);
+  accept_msg->set_paxos_proposal_num(proposal);
+  accept_msg->set_sender_id(message_manager_->GetCurrentPrimary());
+  accept_msg->set_primary_id(message_manager_->GetCurrentPrimary());
+  accept_msg->set_current_view(message_manager_->GetCurrentView());
+
+  replica_communicator_->BroadCast(*accept_msg);
+
+  auto ctx = ContextFromDataSignature(*accept_msg);
+  auto local = std::make_unique<Request>(*accept_msg);
+  ProcessPaxosAccept(std::move(ctx), std::move(local));
+}
+
+void Commitment::PaxosMaybeBroadcastLearn(uint64_t seq) {
+  std::unique_ptr<Request> learn;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto it = paxos_leader_by_seq_.find(seq);
+    if (it == paxos_leader_by_seq_.end() || !it->second->pending_txn) {
+      return;
+    }
+    PaxosLeaderState& st = *it->second;
+    if (st.learn_sent) {
+      return;
+    }
+    if (static_cast<int>(st.accepted_replicas.size()) <
+        config_.GetMinDataReceiveNum()) {
+      return;
+    }
+    st.learn_sent = true;
+    learn = std::make_unique<Request>(*st.pending_txn);
+    const auto acc_it = paxos_acceptor_by_seq_.find(seq);
+    if (acc_it != paxos_acceptor_by_seq_.end() &&
+        !acc_it->second.accepted_value.empty()) {
+      learn->set_data(acc_it->second.accepted_value);
+    }
+    if (verifier_) {
+      auto sig_or = verifier_->SignMessage(learn->data());
+      if (sig_or.ok()) {
+        *learn->mutable_data_signature() = *sig_or;
+      }
+    }
+  }
+
+  learn->set_type(Request::TYPE_PAXOS_LEARN);
+  learn->set_sender_id(message_manager_->GetCurrentPrimary());
+  learn->set_primary_id(message_manager_->GetCurrentPrimary());
+  learn->set_current_view(message_manager_->GetCurrentView());
+
+  replica_communicator_->BroadCast(*learn);
+
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    paxos_leader_by_seq_.erase(seq);
+  }
+}
+
+int Commitment::StartShardPaxos(std::unique_ptr<Request> txn_request) {
+  if (txn_request == nullptr) {
+    return -2;
+  }
+  if (config_.GetSelfInfo().id() != message_manager_->GetCurrentPrimary()) {
+    LOG(ERROR) << "[Paxos] only shard leader may propose";
+    return -2;
+  }
+  const uint64_t seq = txn_request->seq();
+  const std::string hash = txn_request->hash();
+  const int64_t proxy_id = txn_request->proxy_id();
+  uint64_t n = 0;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    n = ++paxos_proposal_counter_;
+    auto st = std::make_unique<PaxosLeaderState>();
+    st->proposal_num = n;
+    st->pending_txn = std::move(txn_request);
+    paxos_leader_by_seq_[seq] = std::move(st);
+  }
+
+  Request prepare;
+  prepare.set_type(Request::TYPE_PAXOS_PREPARE);
+  prepare.set_seq(seq);
+  prepare.set_hash(hash);
+  prepare.set_proxy_id(proxy_id);
+  prepare.set_current_view(message_manager_->GetCurrentView());
+  prepare.set_sender_id(message_manager_->GetCurrentPrimary());
+  prepare.set_primary_id(message_manager_->GetCurrentPrimary());
+  prepare.set_paxos_proposal_num(n);
+
+  replica_communicator_->BroadCast(prepare);
+  return 0;
+}
+
+int Commitment::ProcessPaxosPrepare(std::unique_ptr<Context> context,
+                                    std::unique_ptr<Request> request) {
+  if (context == nullptr || context->signature.signature().empty()) {
+    return -2;
+  }
+  if (request->sender_id() != message_manager_->GetCurrentPrimary()) {
+    LOG(ERROR) << "[Paxos] Prepare not from primary";
+    return -2;
+  }
+  const uint64_t seq = request->seq();
+  const uint64_t n = request->paxos_proposal_num();
+  uint64_t reply_high = 0;
+  std::string reply_val;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto& slot = paxos_acceptor_by_seq_[seq];
+    if (n <= slot.promised && slot.promised != 0) {
+      LOG(ERROR) << "[Paxos] acceptor rejects Prepare n=" << n << " seq=" << seq;
+      return -2;
+    }
+    slot.promised = n;
+    reply_high = slot.accepted_n;
+    reply_val = slot.accepted_value;
+  }
+
+  Request promise;
+  promise.set_type(Request::TYPE_PAXOS_PROMISE);
+  promise.set_seq(seq);
+  promise.set_hash(request->hash());
+  promise.set_proxy_id(request->proxy_id());
+  promise.set_current_view(message_manager_->GetCurrentView());
+  promise.set_sender_id(config_.GetSelfInfo().id());
+  promise.set_primary_id(message_manager_->GetCurrentPrimary());
+  promise.set_paxos_proposal_num(n);
+  promise.set_paxos_promise_highest_accept_num(reply_high);
+  promise.set_paxos_promise_highest_accept_value(reply_val);
+
+  replica_communicator_->SendMessage(promise, message_manager_->GetCurrentPrimary());
+  return 0;
+}
+
+int Commitment::ProcessPaxosPromise(std::unique_ptr<Context> context,
+                                    std::unique_ptr<Request> request) {
+  if (context == nullptr || context->signature.signature().empty()) {
+    return -2;
+  }
+  if (config_.GetSelfInfo().id() != message_manager_->GetCurrentPrimary()) {
+    return 0;
+  }
+  const uint64_t seq = request->seq();
+  const uint64_t n = request->paxos_proposal_num();
+  bool ready = false;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto it = paxos_leader_by_seq_.find(seq);
+    if (it == paxos_leader_by_seq_.end() || !it->second->pending_txn) {
+      return 0;
+    }
+    PaxosLeaderState& st = *it->second;
+    if (st.proposal_num != n) {
+      return 0;
+    }
+    if (!st.promised_replicas.insert(request->sender_id()).second) {
+      return 0;
+    }
+    if (request->paxos_promise_highest_accept_num() > st.best_prior_n) {
+      st.best_prior_n = request->paxos_promise_highest_accept_num();
+      st.best_prior_value = request->paxos_promise_highest_accept_value();
+    }
+    ready = static_cast<int>(st.promised_replicas.size()) >=
+            config_.GetMinDataReceiveNum();
+  }
+  if (ready) {
+    PaxosMaybeSendAccept(seq);
+  }
+  return 0;
+}
+
+int Commitment::ProcessPaxosAccept(std::unique_ptr<Context> context,
+                                   std::unique_ptr<Request> request) {
+  if (context == nullptr || context->signature.signature().empty()) {
+    return -2;
+  }
+  if (request->sender_id() != message_manager_->GetCurrentPrimary()) {
+    LOG(ERROR) << "[Paxos] Accept not from primary";
+    return -2;
+  }
+  const uint64_t seq = request->seq();
+  const uint64_t n = request->paxos_proposal_num();
+
+  if (config_.GetSelfInfo().id() != message_manager_->GetCurrentPrimary()) {
+    if (pre_verify_func_ && !pre_verify_func_(*request)) {
+      return -2;
+    }
+    bool valid =
+        verifier_->VerifyMessage(request->data(), request->data_signature());
+    if (!valid) {
+      LOG(ERROR) << "[Paxos] Accept value failed verify seq=" << seq;
+      return -2;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto& slot = paxos_acceptor_by_seq_[seq];
+    if (slot.promised > n) {
+      LOG(ERROR) << "[Paxos] acceptor rejects Accept n=" << n << " promised="
+                 << slot.promised << " seq=" << seq;
+      return -2;
+    }
+    if (slot.accepted_n == n && slot.accepted_value == request->data()) {
+      // duplicate — still notify leader once is enough; resend accepted
+    } else {
+      slot.accepted_n = n;
+      slot.accepted_value = request->data();
+    }
+  }
+
+
+  Request acc;
+  acc.set_type(Request::TYPE_PAXOS_ACCEPTED);
+  acc.set_seq(seq);
+  acc.set_hash(request->hash());
+  acc.set_proxy_id(request->proxy_id());
+  acc.set_current_view(message_manager_->GetCurrentView());
+  acc.set_sender_id(config_.GetSelfInfo().id());
+  acc.set_primary_id(message_manager_->GetCurrentPrimary());
+  acc.set_paxos_proposal_num(n);
+  acc.clear_data();
+  replica_communicator_->SendMessage(acc, message_manager_->GetCurrentPrimary());
+  return 0;
+}
+
+int Commitment::ProcessPaxosAccepted(std::unique_ptr<Context> context,
+                                     std::unique_ptr<Request> request) {
+  if (context == nullptr || context->signature.signature().empty()) {
+    return -2;
+  }
+  if (config_.GetSelfInfo().id() != message_manager_->GetCurrentPrimary()) {
+    return 0;
+  }
+  const uint64_t seq = request->seq();
+  const uint64_t n = request->paxos_proposal_num();
+  const int64_t acc_id = request->sender_id();
+
+  bool majority = false;
+  {
+    std::lock_guard<std::mutex> lk(paxos_mu_);
+    auto it = paxos_leader_by_seq_.find(seq);
+    if (it == paxos_leader_by_seq_.end() || !it->second->pending_txn) {
+      return 0;
+    }
+    if (it->second->proposal_num != n) {
+      return 0;
+    }
+    if (!it->second->accepted_replicas.insert(acc_id).second) {
+      return 0;
+    }
+    majority = static_cast<int>(it->second->accepted_replicas.size()) >=
+               config_.GetMinDataReceiveNum();
+  }
+  if (majority) {
+    PaxosMaybeBroadcastLearn(seq);
+  }
+  return 0;
+}
+
+int Commitment::ProcessPaxosLearn(std::unique_ptr<Context> context,
+                                  std::unique_ptr<Request> request) {
+  if (context == nullptr || context->signature.signature().empty()) {
+    return -2;
+  }
+  const uint64_t seq = request->seq();
+  if (message_manager_->IsSeqCommitted(seq)) {
+    return 0;
+  }
+
+  const int primary = message_manager_->GetCurrentPrimary();
+  const int self_id = config_.GetSelfInfo().id();
+
+  if (!request->data().empty() && request->sender_id() == primary) {
+    if (self_id != primary) {
+      if (pre_verify_func_ && !pre_verify_func_(*request)) {
+        return -2;
+      }
+      if (!verifier_->VerifyMessage(request->data(), request->data_signature())) {
+        LOG(ERROR) << "[Paxos] Learn verify failed seq=" << seq;
+        return -2;
+      }
+    }
+    const std::string learn_hash = request->hash();
+    const int64_t learn_proxy = request->proxy_id();
+    CollectorResultCode ret =
+        message_manager_->AddConsensusMsg(context->signature, std::move(request));
+    // Every replica (including primary) must broadcast an empty LEARN ack so
+    // MessageManager can reach MinDataReceiveNum on TYPE_PAXOS_LEARN acks
+    // (primary was previously silent, leaving backups with only 2 peers).
+    Request ack;
+    ack.set_type(Request::TYPE_PAXOS_LEARN);
+    ack.set_seq(seq);
+    ack.set_hash(learn_hash);
+    ack.set_proxy_id(learn_proxy);
+    ack.set_current_view(message_manager_->GetCurrentView());
+    ack.set_sender_id(self_id);
+    ack.set_primary_id(primary);
+    ack.clear_data();
+    auto actx = std::make_unique<Context>();
+    if (verifier_) {
+      auto sig_or = verifier_->SignMessage(ack.hash());
+      if (sig_or.ok()) {
+        actx->signature = *sig_or;
+      } else {
+        actx->signature.set_signature("paxos-learn-ack");
+      }
+    } else {
+      actx->signature.set_signature("paxos-learn-ack");
+    }
+    replica_communicator_->BroadCast(ack);
+    return ret == CollectorResultCode::INVALID ? -2 : 0;
+  }
+
+  if (request->data().empty()) {
+    CollectorResultCode ret =
+        message_manager_->AddConsensusMsg(context->signature, std::move(request));
+    return ret == CollectorResultCode::INVALID ? -2 : 0;
+  }
+
+  return -2;
 }
 
 }  // namespace resdb

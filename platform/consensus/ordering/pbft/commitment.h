@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <thread>
@@ -60,6 +61,18 @@ class Commitment {
                      std::unique_ptr<Request> request);
   int Process2PCCommit(std::unique_ptr<Context> context,
                        std::unique_ptr<Request> request);
+
+  // Intra-shard Paxos (Assignment 4) after cross-shard 2PC completes.
+  int ProcessPaxosPrepare(std::unique_ptr<Context> context,
+                          std::unique_ptr<Request> request);
+  int ProcessPaxosPromise(std::unique_ptr<Context> context,
+                            std::unique_ptr<Request> request);
+  int ProcessPaxosAccept(std::unique_ptr<Context> context,
+                         std::unique_ptr<Request> request);
+  int ProcessPaxosAccepted(std::unique_ptr<Context> context,
+                            std::unique_ptr<Request> request);
+  int ProcessPaxosLearn(std::unique_ptr<Context> context,
+                        std::unique_ptr<Request> request);
 
   void SetPreVerifyFunc(std::function<bool(const Request& request)> func);
   void SetNeedCommitQC(bool need_qc);
@@ -104,9 +117,36 @@ class Commitment {
   void Timeout2PC(uint64_t seq);
 
   // Cross-shard 2PC: remote shard leaders stash PREPARE payload by txn hash until
-  // GLOBAL COMMIT, then drive local PBFT.
+  // GLOBAL COMMIT, then drive local Paxos.
   std::mutex participant_twopc_mutex_;
   std::map<std::string, std::unique_ptr<Request>> participant_twopc_by_hash_;
+
+  int StartShardPaxos(std::unique_ptr<Request> txn_request);
+  void PaxosMaybeSendAccept(uint64_t seq);
+  void PaxosMaybeBroadcastLearn(uint64_t seq);
+  static std::unique_ptr<Context> ContextFromDataSignature(
+      const Request& request);
+
+  struct PaxosAcceptorSlot {
+    uint64_t promised = 0;
+    uint64_t accepted_n = 0;
+    std::string accepted_value;
+  };
+  struct PaxosLeaderState {
+    uint64_t proposal_num = 0;
+    std::unique_ptr<Request> pending_txn;
+    std::set<int64_t> promised_replicas;
+    std::set<int64_t> accepted_replicas;
+    uint64_t best_prior_n = 0;
+    std::string best_prior_value;
+    bool accept_sent = false;
+    bool learn_sent = false;
+  };
+
+  std::mutex paxos_mu_;
+  uint64_t paxos_proposal_counter_{0};
+  std::map<uint64_t, PaxosAcceptorSlot> paxos_acceptor_by_seq_;
+  std::map<uint64_t, std::unique_ptr<PaxosLeaderState>> paxos_leader_by_seq_;
 };
 
 }  // namespace resdb

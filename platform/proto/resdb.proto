@@ -63,7 +63,14 @@ message Request {
         TYPE_2PC_VOTE = 23;
         TYPE_2PC_COMMIT = 24;
 
-        NUM_OF_TYPE = 25; // the total number of types.
+        // Intra-shard Paxos (Assignment 4 good-case path after cross-shard 2PC).
+        TYPE_PAXOS_PREPARE = 26;
+        TYPE_PAXOS_PROMISE = 27;
+        TYPE_PAXOS_ACCEPT = 28;
+        TYPE_PAXOS_ACCEPTED = 29;
+        TYPE_PAXOS_LEARN = 30;
+
+        NUM_OF_TYPE = 31; // the total number of types.
                        // Used to create the collector.
     };
     int32 type = 1;
@@ -95,6 +102,11 @@ message Request {
     int64 commit_time = 25;
     bytes data_hash = 26;
     bool force_recovery =27;
+
+    // Paxos ballot / acceptor fields (good-case; no persistence).
+    uint64 paxos_proposal_num = 28;
+    uint64 paxos_promise_highest_accept_num = 29;
+    bytes paxos_promise_highest_accept_value = 30;
 
 }
 

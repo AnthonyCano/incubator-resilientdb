@@ -250,6 +250,21 @@ int ConsensusManagerPBFT::InternalConsensusCommit(
     case Request::TYPE_COMMIT:
       return commitment_->ProcessCommitMsg(std::move(context),
                                            std::move(request));
+    case Request::TYPE_PAXOS_PREPARE:
+      return commitment_->ProcessPaxosPrepare(std::move(context),
+                                              std::move(request));
+    case Request::TYPE_PAXOS_PROMISE:
+      return commitment_->ProcessPaxosPromise(std::move(context),
+                                               std::move(request));
+    case Request::TYPE_PAXOS_ACCEPT:
+      return commitment_->ProcessPaxosAccept(std::move(context),
+                                                std::move(request));
+    case Request::TYPE_PAXOS_ACCEPTED:
+      return commitment_->ProcessPaxosAccepted(std::move(context),
+                                               std::move(request));
+    case Request::TYPE_PAXOS_LEARN:
+      return commitment_->ProcessPaxosLearn(std::move(context),
+                                             std::move(request));
     case Request::TYPE_CHECKPOINT:
       return checkpoint_manager_->ProcessCheckPoint(std::move(context),
                                                     std::move(request));
